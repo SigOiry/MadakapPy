@@ -1,0 +1,17 @@
+name: Madakappy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pillow
+  - tk
+  - scikit-image
+  - scikit-learn
+  - opencv
+  - rasterio
+  - geopandas
+  - shapely
+  - rtree
+  - matplotlib

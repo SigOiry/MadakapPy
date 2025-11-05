@@ -1,0 +1,477 @@
+---
+title: "Image_Processing"
+author: "Simon"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r raster subset}
+# --- Packages ---
+library(terra)
+library(sf)
+library(stars)
+library(supercells)
+library(tidyverse)
+
+r_path <- "data/Ortho_Multi_Overall.tif"
+square_size_m <- 40        
+move_south_m  <- 10  
+
+scale_minmax <- function(x) (x - min(x, na.rm=TRUE)) / (diff(range(x, na.rm=TRUE)))
+
+r <- rast(r_path)[[1:5]]
+
+cx <- (xmin(r) + xmax(r)) / 2
+cy <- (ymin(r) + ymax(r)) / 2
+
+cy <- cy - move_south_m
+
+h <- square_size_m / 2
+
+e <- ext(cx - h, cx + h, cy - h, cy + h)
+
+sq_sf <- as.polygons(e, crs = crs(r)) |> st_as_sf()
+
+r_crop <- crop(r, vect(sq_sf))
+r_sub  <- mask(r_crop, vect(sq_sf))
+
+plot(r_sub, main = "5m x 5m subset (masked)")
+
+
+min_r <- min(as.data.frame(r_sub), na.rm = T)
+max_r <- max(as.data.frame(r_sub), na.rm = T)
+r_sub <- (r_sub - min_r)/(max_r-min_r)
+
+writeRaster(r_sub, "data/Ortho_Multi_Overall_cropped.tif",overwrite = T)
+```
+
+```{r Segmentation}
+library(terra)
+library(sf)
+library(tidyverse)
+library(rstudioapi)
+
+r <- rast(in_raster)[[1]]
+values(r)[which(values(r) == 0)] <- NA
+values(r)[which(values(r) == 65535)] <- NA
+
+# ------------------ Parameters ------------------
+in_raster      <- "data/Ortho_Multi_Overall.tif"   # input raster (multi-band OK; we use band 1)
+tile_size_m    <- 40                               # 40 m x 40 m tiles
+spatialr       <- 5
+minsize        <- 5
+otb_bin        <- "OTB/bin/otbcli_LargeScaleMeanShift.bat"  # Windows .bat
+
+# ------------------ Prep paths ------------------
+dir.create("Temp", showWarnings = FALSE, recursive = TRUE)
+
+# Timestamped run folder and final output .shp (same style you used)
+foldername <- gsub(":","",as.character(Sys.time())) %>% 
+  gsub(" ","_",.) %>% 
+  sub("\\.[^.]*$", "", .) %>% 
+  paste0("1-Segmentation/Run_", .)
+
+out_dir  <- file.path("Output", foldername)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+out_shp  <- file.path(
+  out_dir,
+  gsub("Run_","Segmentation_", basename(foldername))  %>%  paste0(".shp")
+)
+
+# ------------------ Build 40x40 m grid ------------------
+# Assume raster is in a projected CRS in meters (e.g., UTM)
+r_bb  <- st_as_sfc(st_bbox(r, crs = st_crs(r)))
+grid  <- st_make_grid(r_bb, cellsize = c(tile_size_m, tile_size_m), what = "polygons")  %>% 
+  st_sf(id = seq_along(.), geometry = .)
+
+# ------------------ Tile -> Segment -> Temp outputs ------------------
+# We'll write each tile to Temp/tile_{id}.tif and each segment to Temp/seg_{id}.shp
+tile_tif_paths <- file.path("Temp", sprintf("tile_%05d.tif", grid$id))
+seg_shp_paths  <- file.path("Temp", sprintf("seg_%05d.shp",  grid$id))
+
+# Optional: progress bar
+pb <- utils::txtProgressBar(min = 0, max = nrow(grid), style = 3)
+
+for (i in seq_len(nrow(grid))) {
+  g <- grid[i, ]
+
+  # Crop (fast) — if you want exact tile bounds, use terra::crop with ext(g)
+  r_i <- try(crop(r, vect(g)), silent = TRUE)
+  if (inherits(r_i, "try-error") || is.null(r_i)) {
+    utils::setTxtProgressBar(pb, i); next
+  }
+
+  # Skip empty tiles (all NA)
+  if (global(is.na(r_i), "sum", na.rm = FALSE)[1,1] == ncell(r_i)) {
+    utils::setTxtProgressBar(pb, i); next
+  }
+  
+  ranger         <- as.numeric(global(r_i, fun = "sd", na.rm = TRUE)) /2
+
+  # Write tile
+  tif_i <- tile_tif_paths[i]
+  writeRaster(r_i, tif_i, overwrite = TRUE)
+
+  # Segment this tile to vector (Temp/seg_xxxxx.shp)
+  seg_i <- seg_shp_paths[i]
+  cmd <- paste(
+    shQuote(otb_bin),
+    "-in",            shQuote(normalizePath(tif_i, winslash = "/")),
+    "-spatialr",      spatialr,
+    "-ranger",        ranger,
+    "-minsize",       minsize,
+    "-mode",          "vector",
+    "-mode.vector.out", shQuote(normalizePath(seg_i, winslash = "/"))
+  )
+
+  # Run OTB; if it fails, continue to next tile
+  try(system(cmd, intern = FALSE, ignore.stdout = TRUE, ignore.stderr = TRUE), silent = TRUE)
+  
+  list.files(pattern = "FINAL.tif") %>% 
+    file.remove()
+  
+  utils::setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# ------------------ Merge all per-tile shapefiles ------------------
+seg_files <- seg_shp_paths[file.exists(seg_shp_paths)]
+if (length(seg_files) == 0) {
+  stop("No segmented shapefiles produced in Temp/. Check OTB path and parameters.")
+}
+
+# Read and rbind (be lenient about schema differences)
+vec_list <- lapply(seg_files, function(p) try(st_read(p, quiet = TRUE), silent = TRUE))
+vec_list <- vec_list[!vapply(vec_list, inherits, logical(1), what = "try-error")]
+
+# Ensure CRS consistency
+vec_list <- lapply(vec_list, function(v) {
+  if (is.na(st_crs(v))) st_set_crs(v, st_crs(r)) else v
+})
+
+# Bind rows safely (dplyr::bind_rows handles mismatched columns)
+merged <- suppressWarnings(bind_rows(vec_list))
+merged_cleaned <- merged %>% 
+  # slice(1:10) %>% 
+  dplyr::select(label,nbPixels)
+
+# If empty after filtering, abort
+if (nrow(merged) == 0) stop("Merged vector is empty. Nothing to write.")
+
+# Write final shapefile
+st_write(merged_cleaned, gsub("122138.shp","122138_cleaned.shp",out_shp), delete_dsn = TRUE, quiet = TRUE)
+
+message("✅ Done.\n- Final output: ", out_shp)
+
+# ------------------ Optional cleanup ------------------
+# If you want to save space, uncomment the following to remove the tile TIFFs:
+
+list.files("Temp",full.names = T) %>% 
+  file.remove()
+
+
+
+```
+
+```{r Classification}
+# ── Packages ───────────────────────────────────────────────────────────────────
+library(terra)
+library(sf)
+library(tidyverse)
+library(tidymodels)
+
+# ── Inputs (EDIT THESE) ────────────────────────────────────────────────────────
+ras_path <- "data/Ortho_Multi_Overall.tif"         # multiband raster
+shp_path <- "Modeling/Training/OBIA_2025-10-27_140422.shp" # or .shp; layer must include column 'Class'
+model <- "Modeling/rf_classifier_workflow.rds"
+
+
+foldername <- gsub(":","",as.character(Sys.time())) %>% 
+  gsub(" ","_",.)%>%
+  sub("\\.[^.]*$", "", .) %>% 
+  paste0("2-RF/Run_",.)
+
+
+outpath <- paste0("Output/",foldername,"/",gsub("2-RF/Run","RF",foldername),".tif")
+outpath_prob <- gsub(".tif","_prob.tif",outpath)
+
+dir.create(paste0("Output/",foldername),recursive = T)
+
+out_map  <- outpath
+out_prob_dir <- outpath_prob           # a folder for probability rasters
+
+# ── Read data ─────────────────────────────────────────────────────────────────
+r  <- rast(ras_path)            # SpatRaster (multi-band)
+polys_sf <- st_read(shp_path)   # sf polygons with column 'Class'
+
+# Ensure same CRS
+if (!st_crs(polys_sf)$epsg %in% c(NA, crs(r, describe=TRUE)$code)) {
+  polys_sf <- st_transform(polys_sf, crs(r))
+}
+
+  
+# Optional: crop raster to polygon extent to speed up
+r_crop <- crop(r, vect(polys_sf), mask = T)
+
+  # ── Extract pixel samples under polygons ───────────────────────────────────────
+# terra::extract returns a data.frame with ID (polygon row), cell index, and band values
+extract_df <- terra::extract(r_crop, vect(polys_sf), cells = TRUE, df = TRUE)
+
+# Attach string class label from polygons
+extract_df <- extract_df %>%
+  mutate(
+    Class = polys_sf$Class[ID]  %>%  as.character()
+  )
+
+# Clean: drop rows with NA predictors or missing class
+train_df <- extract_df %>%
+  select(-ID) %>%                        # keep 'cell' (optional) and bands
+  drop_na() %>%
+  mutate(Class = factor(Class))          # factor for classification
+
+# Safety: remove constant/near-zero-variance predictors later in recipe
+
+# ── Train/test split (stratified) ─────────────────────────────────────────────
+set.seed(42)
+split_obj <- initial_split(train_df, prop = 0.8, strata = Class)
+train_dat <- training(split_obj)
+test_dat  <- testing(split_obj)
+
+# ── Recipe ────────────────────────────────────────────────────────────────────
+# Remove 'cell' index, keep all raster bands as predictors
+rec <- recipe(Class ~ ., data = train_dat) %>%
+  step_rm(cell) %>%
+  step_zv(all_predictors()) %>%          # remove zero-variance bands (if any)
+  step_nzv(all_predictors())             # (optional) near-zero-variance
+
+# ── Model spec (ranger) ───────────────────────────────────────────────────────
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  min_n = tune(),
+  trees = 500
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity", probability = TRUE)
+
+wf <- workflow() %>% add_model(rf_spec) %>% add_recipe(rec)
+
+# ── Resampling + tuning ───────────────────────────────────────────────────────
+set.seed(42)
+cv <- vfold_cv(train_dat, v = 5, strata = Class)
+
+# For multi-class, accuracy and kap are usually good
+metrics_set <- metric_set(accuracy, kap)
+  
+if(!file.exists(model)){
+  
+  grid <- grid_regular(
+    mtry(range = c(1,5)),
+    min_n(range = c(2L, 20L)),
+    levels = 5
+  )
+  
+  tuned <- tune_grid(
+    wf,
+    resamples = cv,
+    grid = grid,
+    metrics = metrics_set,
+    control = control_grid(save_pred = TRUE)
+  )
+  
+  best <- select_best(tuned, metric = "accuracy")
+  
+  final_wf <- finalize_workflow(wf, best)
+  
+  # ── Fit final model ───────────────────────────────────────────────────────────
+  final_fit <- fit(final_wf, data = train_dat)
+  
+  saveRDS(final_fit, file = model)
+}
+
+final_fit <- readRDS(model)
+
+
+# Evaluate on held-out test set
+test_preds <- predict(final_fit, test_dat) %>%
+  bind_cols(predict(final_fit, test_dat, type = "prob")) %>%
+  bind_cols(test_dat %>% select(Class))
+
+test_metrics <- metrics(test_preds, truth = Class, estimate = .pred_class)
+test_metrics
+
+# Optional: confusion matrix
+test_cm <- conf_mat(test_preds, truth = Class, estimate = .pred_class)
+test_cm
+
+# ── Predict full raster map ───────────────────────────────────────────────────
+# terra::predict works with ranger engine directly
+rf_engine <- extract_fit_engine(final_fit)   # pull the underlying ranger model
+
+# Ensure predictor names in raster match training column names
+# (They usually do: names(r_crop) must be the same as columns used in training)
+stopifnot(all(names(r_crop) %in% colnames(train_dat)))
+
+# 1) Class map (most-probable class)
+class_map_all <- terra::predict(
+  r,
+  model = rf_engine,
+  type  = "response",     # response -> class label
+  na.rm = TRUE,
+  progress = TRUE
+)
+
+# Write classified map
+# dir.create(dirname(out_map), showWarnings = FALSE, recursive = TRUE)
+writeRaster(class_map_all, gsub(".tif","_all.tif",out_map), overwrite = TRUE)
+
+# ── Variable importance (quick look) ──────────────────────────────────────────
+rf_engine$variable.importance %>%
+  sort(decreasing = TRUE) %>%
+  head(10)
+
+```
+
+```{r Classification of polygons}
+library(terra)
+library(tidyverse)
+library(sf)
+
+dir.create(paste0("Output/",foldername),recursive = T)
+
+select_last <- function(path){
+  list.dirs(path)[-1] %>% 
+    as_tibble() %>% 
+    rename(path = "value") %>% 
+    mutate(run = gsub(".*/","",path),
+           date = gsub("Run_","",run) %>% 
+             as.POSIXct(format = "%Y-%m-%d_%H%M%S")) %>% 
+    dplyr::filter(date == max(date)) %>% 
+    pull(path) %>% 
+    list.files(pattern = "\\.(shp|tif)$" ,full.names = T)   
+}
+
+# ── Inputs (EDIT THESE) ────────────────────────────────────────────────────────
+ras_path <- select_last("Output/2-RF/")     # Classification raster
+shp_path <- select_last("Output/1-Segmentation/") [1]           # or .gpkg, must be polygons
+
+# ── Read data ─────────────────────────────────────────────────────────────────
+r  <- rast(ras_path)          # SpatRaster (multi-band)
+polys_sf <- st_read(shp_path) # sf polygons (has column 'Class')
+
+# Make sure CRS matches the raster
+if (!isTRUE(st_crs(polys_sf) == st_crs(crs(r)))) {
+  polys_sf <- st_transform(polys_sf, st_crs(crs(r)))
+}
+
+# Optional: crop raster to polygon extent to speed up
+r_crop <- crop(r, vect(polys_sf))
+
+# Add a stable id to polygons (helps with joins)
+polys_sf <- polys_sf %>% mutate(.poly_id = row_number())
+
+# ── Zonal means per band ──────────────────────────────────────────────────────
+# exact=TRUE does area-weighting for border cells (slower but more precise).
+# Set exact=FALSE for speed (cell-in / cell-out).
+stats_df <- terra::extract(
+  r_crop,
+  vect(polys_sf),
+  fun   = mean,
+  na.rm = TRUE,
+  exact = FALSE   # <- flip to FALSE if speed matters more than precision
+  # df    = TRUE
+)
+
+# stats_df has columns: ID, <band1>, <band2>, ...
+# Join means back to polygons
+polys_stats <- polys_sf %>%
+  left_join(stats_df %>% rename(.poly_id = ID), by = ".poly_id") %>% 
+  dplyr::select(-c(meanB0,varB0, .poly_id)) %>% 
+  pivot_longer(-c(label,nbPixels,geometry), names_to = "Class", values_to = "Prob") %>% 
+  group_by(label) %>% 
+  mutate(
+    Maj_Class = Class[which.max(Prob)],
+    Maj_Prob  = Prob[which.max(Prob)]
+  ) %>% 
+  ungroup() %>% 
+  mutate(Maj_Class = as_factor(Maj_Class)) %>% 
+  pivot_wider(names_from = Class,values_from = Prob)
+
+
+foldername <- gsub(":","",as.character(Sys.time())) %>% 
+  gsub(" ","_",.)%>%
+  sub("\\.[^.]*$", "", .) %>% 
+  paste0("3-OBIA/Run_",.)
+
+
+outpath <- paste0("Output/",foldername,"/",gsub("3-OBIA/Run","OBIA",foldername),".shp")
+
+
+write_sf(polys_stats,outpath)
+
+```
+
+```{r Fallen Kappa}
+library(sf)
+library(dplyr)
+library(stringr)
+
+select_last <- function(path){
+  list.dirs(path)[-1] %>% 
+    as_tibble() %>% 
+    rename(path = "value") %>% 
+    mutate(run = gsub(".*/","",path),
+           date = gsub("Run_","",run) %>% 
+             as.POSIXct(format = "%Y-%m-%d_%H%M%S")) %>% 
+    dplyr::filter(date == max(date)) %>% 
+    pull(path) %>% 
+    list.files(pattern = "\\.(shp|tif)$" ,full.names = T)   
+}
+
+
+
+foldername <- gsub(":","",as.character(Sys.time())) %>% 
+  gsub(" ","_",.)%>%
+  sub("\\.[^.]*$", "", .) %>% 
+  paste0("4-Fallen_Kappa_detection/Run_",.)
+
+
+outpath <- paste0("Output/",foldername,"/",gsub("4-Fallen_Kappa_detection/Run","Fallen_Kappa",foldername),".shp")
+
+dir.create(paste0("Output/",foldername),recursive = T)
+
+
+
+shp <- select_last("Output/3-OBIA/")   # <- your file
+
+# Read + make safe + add id
+polys <- st_read(shp, quiet = TRUE) %>%
+  st_make_valid() %>%
+  mutate(.id = row_number())
+
+# Define class names (robust to slight label variants/case)
+is_bottom_algae    <- str_to_lower(polys$Maj_Class) %in% c("bottom_algae", "bottom_alg", "bottom alg", "bottom-algae")
+is_kappa <- str_to_lower(polys$Maj_Class) %in% c("kappa")
+
+bottom_algae     <- polys[is_bottom_algae, ]
+kappa <- polys[is_kappa, ]
+
+# Find red polygons that TOUCH any yellow polygon (boundary contact, no overlap)
+# (corner contact counts; see note below for edge-only option)
+tch <- st_touches(bottom_algae, kappa)              # list of integer vectors
+red_touch_ids <- bottom_algae$.id[lengths(tch) > 0]  # red ids that touch at least one yellow
+
+# Reclassify those red polygons
+polys_out <- polys %>%
+  mutate(Maj_Class = if_else(.id %in% red_touch_ids, "Fallen_Kappa", Maj_Class),
+         Edited = if_else(.id %in% red_touch_ids, 1, 0)) %>% 
+  dplyr::select(-.id)
+
+write_sf(polys_out,outpath)
+
+```
+
+
+
+
+
