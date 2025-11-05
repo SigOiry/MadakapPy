@@ -1,0 +1,12 @@
+PantexTextureExtraction|out
+Computes Pantex textural features on the selected channel of the input image
+Feature Extraction
+QgsProcessingParameterRasterLayer|in|Input Image|None|False
+QgsProcessingParameterNumber|channel|Selected Channel|QgsProcessingParameterNumber.Integer|1|True
+QgsProcessingParameterRasterDestination|out|Output Image|None|False
+QgsProcessingParameterNumber|min|Image minimum|QgsProcessingParameterNumber.Double|0|True
+QgsProcessingParameterNumber|max|Image maximum|QgsProcessingParameterNumber.Double|0|True
+QgsProcessingParameterNumber|sradx|Window radius (x direction)|QgsProcessingParameterNumber.Integer|4|True
+QgsProcessingParameterNumber|srady|Window radius (y direction)|QgsProcessingParameterNumber.Integer|4|True
+QgsProcessingParameterNumber|nbin|Number of bins per axis for histogram generation|QgsProcessingParameterNumber.Integer|8|True
+*QgsProcessingParameterEnum|outputpixeltype|Output pixel type|uint8;int;float;double|False|2|True

@@ -1,0 +1,6 @@
+Synthetize|out
+This is the Synthetize application
+Image Manipulation
+QgsProcessingParameterString|il|Input images list|None|True|True
+QgsProcessingParameterRasterDestination|out|Output Image|None|False
+*QgsProcessingParameterEnum|outputpixeltype|Output pixel type|uint8;int;float;double|False|2|True

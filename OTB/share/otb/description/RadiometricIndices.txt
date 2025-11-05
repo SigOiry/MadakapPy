@@ -1,0 +1,12 @@
+RadiometricIndices|out
+Compute radiometric indices.
+Feature Extraction
+QgsProcessingParameterRasterLayer|in|Input Image|None|False
+QgsProcessingParameterRasterDestination|out|Output Image|None|False
+QgsProcessingParameterNumber|channels.blue|Blue Channel|QgsProcessingParameterNumber.Integer|1|True
+QgsProcessingParameterNumber|channels.green|Green Channel|QgsProcessingParameterNumber.Integer|1|True
+QgsProcessingParameterNumber|channels.red|Red Channel|QgsProcessingParameterNumber.Integer|1|True
+QgsProcessingParameterNumber|channels.nir|NIR Channel|QgsProcessingParameterNumber.Integer|1|True
+QgsProcessingParameterNumber|channels.mir|Mir Channel|QgsProcessingParameterNumber.Integer|1|True
+QgsProcessingParameterEnum|list|Available Radiometric Indices|Vegetation:NDVI;Vegetation:TNDVI;Vegetation:RVI;Vegetation:SAVI;Vegetation:TSAVI;Vegetation:MSAVI;Vegetation:MSAVI2;Vegetation:GEMI;Vegetation:IPVI;Vegetation:LAIFromNDVILog;Vegetation:LAIFromReflLinear;Vegetation:LAIFromNDVIFormo;Water:NDWI;Water:NDWI2;Water:MNDWI;Water:NDTI;Soil:RI;Soil:CI;Soil:BI;Soil:BI2;BuiltUp:ISU|True|None|True
+*QgsProcessingParameterEnum|outputpixeltype|Output pixel type|uint8;int;float;double|False|2|True

@@ -1,0 +1,10 @@
+SpectralAngleClassification
+Classifies an image using a spectral measure.
+Hyperspectral
+QgsProcessingParameterRasterLayer|in|Input Image Filename|None|False
+QgsProcessingParameterRasterLayer|ie|Input endmembers|None|False
+QgsProcessingParameterRasterDestination|measure|Output spectral angle values|None|True
+QgsProcessingParameterRasterDestination|out|Output classified image|None|True
+OTBParameterChoice|mode|Measure used for classification|sam;sid|0|True
+QgsProcessingParameterNumber|threshold|Classification threshold|QgsProcessingParameterNumber.Double|0|True
+QgsProcessingParameterNumber|bv|Background value|QgsProcessingParameterNumber.Integer|0|True

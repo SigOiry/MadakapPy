@@ -13,6 +13,12 @@ SESSION_FILENAME = "session.json"
 class Session:
     images: List[str]
     output_dir: Optional[str] = None
+    # Segmentation parameters
+    seg_in_raster: Optional[str] = None
+    seg_tile_size_m: int = 40
+    seg_spatialr: int = 5
+    seg_minsize: int = 5
+    seg_otb_bin: Optional[str] = None
 
 
 def save_session(session: Session, location: Path | None = None) -> Path:
@@ -31,5 +37,12 @@ def load_session(location: Path | None = None) -> Optional[Session]:
         return None
     with fp.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    return Session(images=data.get("images", []), output_dir=data.get("output_dir"))
-
+    return Session(
+        images=data.get("images", []),
+        output_dir=data.get("output_dir"),
+        seg_in_raster=data.get("seg_in_raster"),
+        seg_tile_size_m=int(data.get("seg_tile_size_m", 40)),
+        seg_spatialr=int(data.get("seg_spatialr", 5)),
+        seg_minsize=int(data.get("seg_minsize", 5)),
+        seg_otb_bin=data.get("seg_otb_bin"),
+    )

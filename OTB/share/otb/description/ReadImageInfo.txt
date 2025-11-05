@@ -1,0 +1,6 @@
+ReadImageInfo
+Get information about the image
+Image Manipulation
+QgsProcessingParameterRasterLayer|in|Input Image|None|False
+QgsProcessingParameterBoolean|imagemetadata|Display the image metadata|false|True
+QgsProcessingParameterFileDestination|outgeom|Write the image metadata to a geom file|None|None|True
