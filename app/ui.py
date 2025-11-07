@@ -22,7 +22,7 @@ from .classification import (
     train_model_from_training_polys,
     apply_model_with_pixel_sampling,
 )
-from .predetection import PreDetectionResult, run_predetection
+from .predetection import detect_cultivation_plots, save_preselection_to_output
 import geopandas as gpd
 
 
@@ -41,7 +41,7 @@ class ImageSelectorApp(ttk.Frame):
         self._seg_gdf: gpd.GeoDataFrame | None = None
         self._last_seg_path: str | None = None
         self._model_path: str | None = None
-        self._pred_path: str | None = None
+        self._last_aoi_path: str | None = None
         self._cm_photo = None
 
         # Segmentation parameters
@@ -141,13 +141,6 @@ class ImageSelectorApp(ttk.Frame):
         ttk.Entry(seg, textvariable=self.var_otb_bin, width=56).grid(row=1, column=1, columnspan=4, sticky="we", padx=6, pady=6)
         ttk.Button(seg, text="🔧 Browse", command=self._on_pick_otb).grid(row=1, column=5, padx=6, pady=6)
 
-        self.btn_predetect = ttk.Button(
-            seg,
-            text="▶ Run pre-detection",
-            command=self._on_run_predetection,
-        )
-        self.btn_predetect.grid(row=2, column=0, columnspan=6, sticky="we", padx=6, pady=(4, 4))
-
         # No per-step run button; a single workflow button is provided in footer
 
         # Right column
@@ -211,8 +204,10 @@ class ImageSelectorApp(ttk.Frame):
         self.progress.grid(row=0, column=1, sticky="e", padx=(0, 8))
         self.eta = ttk.Label(footer, text="", foreground="#666")
         self.eta.grid(row=0, column=2, sticky="e", padx=(0, 8))
+        self.pre_btn = ttk.Button(footer, text="Run Preselection", command=self._on_run_preselection)
+        self.pre_btn.grid(row=0, column=3, sticky="e", padx=(0,8))
         self.run_btn = ttk.Button(footer, text="▶ Run Workflow", command=self._on_run_workflow, style="Primary.TButton")
-        self.run_btn.grid(row=0, column=3, sticky="e")
+        self.run_btn.grid(row=0, column=4, sticky="e")
 
         self._toggle_model_mode()
         # Shortcuts
@@ -288,43 +283,6 @@ class ImageSelectorApp(ttk.Frame):
             self.var_otb_bin.set(path)
             self._set_status("OTB path set")
 
-    def _on_run_predetection(self) -> None:
-        in_raster = (self.var_in_raster.get() or "").strip()
-        if not in_raster or not os.path.exists(in_raster):
-            self._toast("Select a valid input raster", kind="error")
-            return
-        self.output_dir = self.output_dir or self.out_entry.get()
-        output_dir = (self.output_dir or "").strip()
-        if not output_dir:
-            self._invalidate_field(self.out_entry, msg="Select output directory")
-            self._toast("Please select an output directory", kind="error")
-            return
-
-        self._set_controls_state("disabled")
-        self.progress.configure(value=0, maximum=100)
-        self.eta.configure(text="")
-        self._set_status("Running pre-detection…")
-
-        start0 = time.time()
-
-        def cb(done: int, total: int, note: str = "") -> None:
-            msg = note or "Pre-detection"
-            self.after(0, self._update_progress, done, max(1, total), start0, msg)
-
-        def worker() -> None:
-            try:
-                result = run_predetection(
-                    in_raster=in_raster,
-                    output_root=output_dir,
-                    progress=cb,
-                )
-            except Exception as exc:
-                self.after(0, lambda: self._on_predetection_failed(str(exc)))
-                return
-            self.after(0, lambda: self._on_predetection_success(result))
-
-        threading.Thread(target=worker, daemon=True).start()
-
     # ─────────── Segmentation ───────────
     def _on_run_workflow(self) -> None:
         in_raster = self.var_in_raster.get()
@@ -368,7 +326,20 @@ class ImageSelectorApp(ttk.Frame):
                     self.after(0, self._update_progress, done, max(1, total), start0, msg)
                 return cb
 
-            # Step 1: segmentation
+            # Step 0: preselection (AOI)
+            try:
+                aoi_temp, n_polys = detect_cultivation_plots(
+                    raster_path=session.seg_in_raster,
+                    output_root=session.output_dir,
+                    progress=make_cb("Preselection"),
+                )
+                aoi_final = save_preselection_to_output(aoi_temp, session.output_dir)
+                self._last_aoi_path = str(aoi_final)
+            except Exception as e:
+                self.after(0, lambda: self._on_workflow_failed(f"Preselection failed: {e}"))
+                return
+
+            # Step 1: segmentation (full image)
             try:
                 seg_res = run_segmentation(
                     in_raster=session.seg_in_raster,
@@ -379,7 +350,27 @@ class ImageSelectorApp(ttk.Frame):
                     minsize=int(session.seg_minsize),
                     progress=make_cb("Segmentation"),
                 )
-                self._last_seg_path = str(seg_res.out_shp)
+                # Filter segments to AOI
+                try:
+                    seg_gdf = gpd.read_file(seg_res.out_shp)
+                    aoi_gdf = gpd.read_file(self._last_aoi_path) if self._last_aoi_path else None
+                    if aoi_gdf is not None and len(aoi_gdf) > 0:
+                        if seg_gdf.crs and aoi_gdf.crs and str(seg_gdf.crs) != str(aoi_gdf.crs):
+                            aoi_gdf = aoi_gdf.to_crs(seg_gdf.crs)
+                        filt = gpd.sjoin(seg_gdf, aoi_gdf, predicate="intersects", how="inner")
+                        if "index_right" in filt.columns:
+                            filt = filt.drop(columns=["index_right"])
+                        # Drop duplicates that may arise from overlapping AOIs
+                        filt = filt.loc[~filt.geometry.is_empty].copy()
+                        filt = filt.reset_index(drop=True)
+                        out_aoi_seg = seg_res.out_dir / f"{seg_res.out_shp.stem}_AOI.shp"
+                        filt.to_file(out_aoi_seg)
+                        self._last_seg_path = str(out_aoi_seg)
+                    else:
+                        self._last_seg_path = str(seg_res.out_shp)
+                except Exception:
+                    # If filtering fails, fall back to full segmentation
+                    self._last_seg_path = str(seg_res.out_shp)
             except Exception as e:
                 self.after(0, lambda: self._on_workflow_failed(f"Segmentation failed: {e}"))
                 return
@@ -471,6 +462,45 @@ class ImageSelectorApp(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _on_run_preselection(self) -> None:
+        in_raster = self.var_in_raster.get()
+        if not in_raster:
+            self._invalidate_field(self.out_entry, msg="Select an input raster")
+            self._toast("Please select an input raster", kind="error")
+            return
+        self.output_dir = self.output_dir or self.out_entry.get()
+        if not self.output_dir:
+            self._invalidate_field(self.out_entry, msg="Select output directory")
+            self._toast("Please select an output directory", kind="error")
+            return
+
+        self._set_controls_state("disabled")
+        self.progress.configure(value=0, maximum=100)
+        self.eta.configure(text="")
+        self._set_status("Running preselection…")
+
+        def worker():
+            start0 = time.time()
+            def cb(done: int, total: int, note: str = ""):
+                self.after(0, self._update_progress, done, max(1, total), start0, note or "Preselection")
+            try:
+                aoi_temp, n_polys = detect_cultivation_plots(
+                    raster_path=in_raster,
+                    output_root=self.output_dir,
+                    progress=cb,
+                )
+                aoi_final = save_preselection_to_output(aoi_temp, self.output_dir)
+                self._last_aoi_path = str(aoi_final)
+                def done_ui():
+                    self._set_controls_state("normal")
+                    self._set_status("Preselection complete")
+                    messagebox.showinfo("Preselection", f"Detected {n_polys} plots.\nSaved to:\n{aoi_final}")
+                self.after(0, done_ui)
+            except Exception as e:
+                self.after(0, lambda: self._on_workflow_failed(f"Preselection failed: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _blocking_dialog(self, func):
         # Run a filedialog-like function in the main thread and wait for its result
         result_box = {"val": None}
@@ -519,28 +549,6 @@ class ImageSelectorApp(ttk.Frame):
                 im.thumbnail((800, 600))
                 self._cm_photo = ImageTk.PhotoImage(im)
                 self.cm_label.configure(image=self._cm_photo)
-        except Exception:
-            pass
-
-    def _on_predetection_success(self, res: PreDetectionResult) -> None:
-        self._pred_path = str(res.vector_path)
-        self._set_controls_state("normal")
-        self._set_status(f"Pre-detection complete ({res.plot_count} plots)")
-        self._toast(f"Detected {res.plot_count} plots", kind="info")
-        try:
-            messagebox.showinfo(
-                "Pre-detection complete",
-                f"Detected {res.plot_count} plots.\nSaved to:\n{res.vector_path}\nSummary:\n{res.summary_path}",
-            )
-        except Exception:
-            pass
-
-    def _on_predetection_failed(self, msg: str) -> None:
-        self._set_controls_state("normal")
-        self._set_status(f"Pre-detection failed: {msg}")
-        self._toast("Pre-detection failed", kind="error")
-        try:
-            messagebox.showerror("Pre-detection failed", msg)
         except Exception:
             pass
 
