@@ -54,13 +54,13 @@ def run_flet_app() -> None:
             content=ft.Container(tile, padding=12, bgcolor=(bgcolor or pal["card"]), border_radius=12, border=ft.border.all(1, pal["border"]))
         )
 
-    def labeled_row(label: str, control: ft.Control, icon: Optional[str] = None) -> ft.Row:
+    def labeled_row(label: str, control: ft.Control, icon: Optional[str] = None, tip: Optional[str] = None) -> ft.Row:
         pal = _palette()
-        lbl = ft.Row([
+        lbl_core = ft.Row([
             ft.Icon(icon, size=16, color=pal["muted"]) if icon else ft.Container(width=0),
-            ft.Text(label),
+            ft.Text(label, tooltip=(tip or None)),
         ], spacing=6)
-        return ft.Row([ft.Container(lbl, width=210), ft.Container(control, expand=True)])
+        return ft.Row([ft.Container(lbl_core, width=230), ft.Container(control, expand=True)])
 
     def build_preview_html(aoi_path: str, raster_path: str) -> Optional[str]:
         try:
@@ -142,6 +142,7 @@ def run_flet_app() -> None:
 
         # Preselection controls (with requested defaults)
         pre_disable_filters = ft.Checkbox(label="Disable filters (raw)", value=False)
+        pre_disable_filters.tooltip = "Bypass all polygon filters; export raw rectangles."
         pre_mask_mode = ft.Dropdown(options=[ft.dropdown.Option("and"), ft.dropdown.Option("or")], value="and", width=140)
         pre_min_region = ft.TextField(value="300", width=120)
         pre_ar_min = ft.TextField(value="1.2", width=120)
@@ -155,6 +156,7 @@ def run_flet_app() -> None:
         pre_downscale = ft.TextField(value="1200", width=120)
         pre_blue_band = ft.TextField(value="1", width=100)
         pre_clahe_enable = ft.Checkbox(label="CLAHE", value=True)
+        pre_clahe_enable.tooltip = "Enable local-contrast enhancement (CLAHE)."
         pre_clahe_clip = ft.TextField(value="2.0", width=100)
         pre_clahe_tile = ft.TextField(value="8", width=100)
         pre_tex_win = ft.TextField(value="10", width=100)
@@ -337,9 +339,9 @@ def run_flet_app() -> None:
         # Layout â€“ Project Paths (neutral)
         left = section(
             "Project Paths",
-            labeled_row("Input raster", ft.Row([in_raster, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_raster.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.IMAGE_OUTLINED),
-            labeled_row("Output directory", ft.Row([output_dir, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: dp_output.get_directory_path())], expand=True), icon=ft.icons.FOLDER),
-            labeled_row("OTB path", ft.Row([otb_bin, ft.OutlinedButton("Browse", icon=ft.icons.BUILD_OUTLINED, on_click=lambda _: fp_otb.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.BUILD_OUTLINED),
+            labeled_row("Input raster", ft.Row([in_raster, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_raster.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.IMAGE_OUTLINED, tip="Path to input imagery (GeoTIFF)."),
+            labeled_row("Output directory", ft.Row([output_dir, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: dp_output.get_directory_path())], expand=True), icon=ft.icons.FOLDER, tip="Folder where results will be written."),
+            labeled_row("OTB path", ft.Row([otb_bin, ft.OutlinedButton("Browse", icon=ft.icons.BUILD_OUTLINED, on_click=lambda _: fp_otb.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.BUILD_OUTLINED, tip="Path to OTB LargeScaleMeanShift executable."),
             subtitle="Set inputs and outputs.",
             bgcolor=pal["alt"],
         )
@@ -351,39 +353,39 @@ def run_flet_app() -> None:
                 title=ft.Row([ft.Icon(ft.icons.FILTER_ALT), ft.Text("Masks & gating", weight=ft.FontWeight.W_600)], spacing=8),
                 initially_expanded=True,
                 controls=[
-                    ft.Row([pre_disable_filters, labeled_row("Mask mode", pre_mask_mode, icon=ft.icons.FILTER_ALT), labeled_row("Min region (px)", pre_min_region, icon=ft.icons.GRID_ON)], wrap=True),
-                    ft.Row([labeled_row("AR min", pre_ar_min, icon=ft.icons.STRAIGHTEN), labeled_row("AR max", pre_ar_max, icon=ft.icons.STRAIGHTEN), labeled_row("Orient tol (deg)", pre_orient_tol, icon=ft.icons.EXPLORE)], wrap=True),
-                    ft.Row([labeled_row("Width m [min]", pre_wmin, icon=ft.icons.UNFOLD_MORE), labeled_row("Width m [max]", pre_wmax, icon=ft.icons.UNFOLD_MORE), labeled_row("Length m [min]", pre_lmin, icon=ft.icons.SPACE_BAR), labeled_row("Length m [max]", pre_lmax, icon=ft.icons.SPACE_BAR)], wrap=True),
+                    ft.Row([pre_disable_filters, labeled_row("Mask mode", pre_mask_mode, icon=ft.icons.FILTER_ALT, tip="Combine masks: AND conservative, OR permissive."), labeled_row("Min region (px)", pre_min_region, icon=ft.icons.GRID_ON, tip="Minimum connected-component size at downscaled resolution.")], wrap=True),
+                    ft.Row([labeled_row("AR min", pre_ar_min, icon=ft.icons.STRAIGHTEN, tip="Minimum aspect ratio (long/short)."), labeled_row("AR max", pre_ar_max, icon=ft.icons.STRAIGHTEN, tip="Maximum aspect ratio (long/short)."), labeled_row("Orient tol (deg)", pre_orient_tol, icon=ft.icons.EXPLORE, tip="Tolerance around dominant plot orientation.")], wrap=True),
+                    ft.Row([labeled_row("Width m [min]", pre_wmin, icon=ft.icons.UNFOLD_MORE, tip="Minimum expected plot width (m)."), labeled_row("Width m [max]", pre_wmax, icon=ft.icons.UNFOLD_MORE, tip="Maximum expected plot width (m)."), labeled_row("Length m [min]", pre_lmin, icon=ft.icons.SPACE_BAR, tip="Minimum expected plot length (m)."), labeled_row("Length m [max]", pre_lmax, icon=ft.icons.SPACE_BAR, tip="Maximum expected plot length (m).")], wrap=True),
                 ],
             ),
             ft.ExpansionTile(
                 title=ft.Row([ft.Icon(ft.icons.IMAGE), ft.Text("Image transforms", weight=ft.FontWeight.W_600)], spacing=8),
                 initially_expanded=False,
                 controls=[
-                    ft.Row([labeled_row("Downscale max (px)", pre_downscale, icon=ft.icons.PHOTO_SIZE_SELECT_LARGE), labeled_row("Blue band index", pre_blue_band, icon=ft.icons.PALETTE)], wrap=True),
-                    ft.Row([pre_clahe_enable, labeled_row("CLAHE clip", pre_clahe_clip, icon=ft.icons.TONALITY), labeled_row("CLAHE tile", pre_clahe_tile, icon=ft.icons.GRID_ON)], wrap=True),
-                    ft.Row([labeled_row("Texture window", pre_tex_win, icon=ft.icons.TEXTURE)], wrap=True),
+                    ft.Row([labeled_row("Downscale max (px)", pre_downscale, icon=ft.icons.PHOTO_SIZE_SELECT_LARGE, tip="Max width/height of working raster for detection."), labeled_row("Blue band index", pre_blue_band, icon=ft.icons.PALETTE, tip="1-based band index used as Blue." )], wrap=True),
+                    ft.Row([pre_clahe_enable, labeled_row("CLAHE clip", pre_clahe_clip, icon=ft.icons.TONALITY, tip="CLAHE clip limit."), labeled_row("CLAHE tile", pre_clahe_tile, icon=ft.icons.GRID_ON, tip="CLAHE tile size (pixels).")], wrap=True),
+                    ft.Row([labeled_row("Texture window", pre_tex_win, icon=ft.icons.TEXTURE, tip="Window size for local standard-deviation texture.")], wrap=True),
                 ],
             ),
             ft.ExpansionTile(
                 title=ft.Row([ft.Icon(ft.icons.TUNE), ft.Text("Thresholds", weight=ft.FontWeight.W_600)], spacing=8),
                 initially_expanded=False,
                 controls=[
-                    ft.Row([labeled_row("Blue thr relax", pre_thr_b_relax, icon=ft.icons.TUNE), labeled_row("Tex thr relax", pre_thr_t_relax, icon=ft.icons.TUNE)], wrap=True),
+                    ft.Row([labeled_row("Blue thr relax", pre_thr_b_relax, icon=ft.icons.TUNE, tip="Multiplier < 1.0 lowers Otsu threshold for blue mask."), labeled_row("Tex thr relax", pre_thr_t_relax, icon=ft.icons.TUNE, tip="Multiplier < 1.0 lowers Otsu threshold for texture mask.")], wrap=True),
                 ],
             ),
             ft.ExpansionTile(
                 title=ft.Row([ft.Icon(ft.icons.CATEGORY), ft.Text("Morphology & detection", weight=ft.FontWeight.W_600)], spacing=8),
                 initially_expanded=False,
                 controls=[
-                    ft.Row([labeled_row("Closing radius", pre_morph_radius, icon=ft.icons.CATEGORY), labeled_row("Hole area frac", pre_hole_frac, icon=ft.icons.DONUT_LARGE), labeled_row("Approx eps frac", pre_approx_eps, icon=ft.icons.STRAIGHTEN)], wrap=True),
+                    ft.Row([labeled_row("Closing radius", pre_morph_radius, icon=ft.icons.CATEGORY, tip="Binary closing radius (pixels)."), labeled_row("Hole area frac", pre_hole_frac, icon=ft.icons.DONUT_LARGE, tip="Fraction of min region to fill holes."), labeled_row("Approx eps frac", pre_approx_eps, icon=ft.icons.STRAIGHTEN, tip="Perimeter fraction used by polygon simplification.")], wrap=True),
                 ],
             ),
             ft.ExpansionTile(
                 title=ft.Row([ft.Icon(ft.icons.LAYERS), ft.Text("Post-filtering", weight=ft.FontWeight.W_600)], spacing=8),
                 initially_expanded=False,
                 controls=[
-                    ft.Row([labeled_row("Fill ratio min", pre_fill_min, icon=ft.icons.SPACE_BAR), labeled_row("NMS IoU", pre_nms_iou, icon=ft.icons.LAYERS_CLEAR), labeled_row("Shrink buffer (m)", pre_buf_shrink, icon=ft.icons.BORDER_INNER)], wrap=True),
+                    ft.Row([labeled_row("Fill ratio min", pre_fill_min, icon=ft.icons.SPACE_BAR, tip="Contour area / rectangle area must be >= this value."), labeled_row("NMS IoU", pre_nms_iou, icon=ft.icons.LAYERS_CLEAR, tip="Max overlap allowed during non-max suppression."), labeled_row("Shrink buffer (m)", pre_buf_shrink, icon=ft.icons.BORDER_INNER, tip="Inset polygons by this distance (meters).")], wrap=True),
                 ],
             ),
             subtitle="Tune AOI detection and run.",
@@ -396,9 +398,9 @@ def run_flet_app() -> None:
         seg = section(
             "Segmentation",
             ft.Row([
-                labeled_row("Tile size (m)", tile_size, icon=ft.icons.STRAIGHTEN),
-                labeled_row("Spatialr", spatialr, icon=ft.icons.GRAIN),
-                labeled_row("Minsize", minsize, icon=ft.icons.DETAILS),
+                labeled_row("Tile size (m)", tile_size, icon=ft.icons.STRAIGHTEN, tip="Tile size for mean-shift segmentation."),
+                labeled_row("Spatialr", spatialr, icon=ft.icons.GRAIN, tip="Spatial radius parameter of mean-shift."),
+                labeled_row("Minsize", minsize, icon=ft.icons.DETAILS, tip="Minimum region size for merging."),
             ], wrap=True),
             subtitle="OTB LargeScaleMeanShift parameters.",
             bgcolor="#ECF4FB",
@@ -426,12 +428,12 @@ def run_flet_app() -> None:
 
         clf = section(
             "Classification",
-            ft.Row([ft.Text("Mode", width=210), clf_mode], wrap=False),
+            ft.Row([ft.Text("Mode", width=210, tooltip="Use an existing model or train a new one."), clf_mode], wrap=False),
             ft.Divider(height=8),
-            labeled_row("Model (.joblib)", ft.Row([model_path, ft.OutlinedButton("Browse", icon=ft.icons.UPLOAD_FILE, on_click=lambda _: fp_model.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.SAVE_ALT),
-            labeled_row("Training polygons", ft.Row([train_polys, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_train.pick_files(allow_multiple=False)), ft.OutlinedButton("Load Fields", icon=ft.icons.TABLE_VIEW, on_click=load_fields)], expand=True), icon=ft.icons.MAP_OUTLINED),
-            ft.Row([labeled_row("Class column", class_column, icon=ft.icons.LIST_ALT), labeled_row("Max pixels/class", max_pixels_per_class, icon=ft.icons.SPEED)], wrap=True),
-            ft.Row([labeled_row("Max pixels/polygon", max_pixels_per_polygon, icon=ft.icons.SPEED)], wrap=True),
+            labeled_row("Model (.joblib)", ft.Row([model_path, ft.OutlinedButton("Browse", icon=ft.icons.UPLOAD_FILE, on_click=lambda _: fp_model.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.SAVE_ALT, tip="Path to saved classifier model (.joblib)."),
+            labeled_row("Training polygons", ft.Row([train_polys, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_train.pick_files(allow_multiple=False)), ft.OutlinedButton("Load Fields", icon=ft.icons.TABLE_VIEW, on_click=load_fields)], expand=True), icon=ft.icons.MAP_OUTLINED, tip="Vector dataset of labeled training polygons."),
+            ft.Row([labeled_row("Class column", class_column, icon=ft.icons.LIST_ALT, tip="Column name containing class labels."), labeled_row("Max pixels/class", max_pixels_per_class, icon=ft.icons.SPEED, tip="Maximum sampled pixels per class (0 = no cap).")], wrap=True),
+            ft.Row([labeled_row("Max pixels/polygon", max_pixels_per_polygon, icon=ft.icons.SPEED, tip="Maximum sampled pixels per polygon.")], wrap=True),
             subtitle="Use an existing model or train a new one, then apply.",
             bgcolor="#FFF4EA",
         )
