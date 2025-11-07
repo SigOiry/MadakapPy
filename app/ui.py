@@ -22,6 +22,7 @@ from .classification import (
     train_model_from_training_polys,
     apply_model_with_pixel_sampling,
 )
+from .predetection import PreDetectionResult, run_predetection
 import geopandas as gpd
 
 
@@ -40,6 +41,7 @@ class ImageSelectorApp(ttk.Frame):
         self._seg_gdf: gpd.GeoDataFrame | None = None
         self._last_seg_path: str | None = None
         self._model_path: str | None = None
+        self._pred_path: str | None = None
         self._cm_photo = None
 
         # Segmentation parameters
@@ -138,6 +140,13 @@ class ImageSelectorApp(ttk.Frame):
         ttk.Label(seg, text="OTB LargeScaleMeanShift path").grid(row=1, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(seg, textvariable=self.var_otb_bin, width=56).grid(row=1, column=1, columnspan=4, sticky="we", padx=6, pady=6)
         ttk.Button(seg, text="🔧 Browse", command=self._on_pick_otb).grid(row=1, column=5, padx=6, pady=6)
+
+        self.btn_predetect = ttk.Button(
+            seg,
+            text="▶ Run pre-detection",
+            command=self._on_run_predetection,
+        )
+        self.btn_predetect.grid(row=2, column=0, columnspan=6, sticky="we", padx=6, pady=(4, 4))
 
         # No per-step run button; a single workflow button is provided in footer
 
@@ -278,6 +287,43 @@ class ImageSelectorApp(ttk.Frame):
         if path:
             self.var_otb_bin.set(path)
             self._set_status("OTB path set")
+
+    def _on_run_predetection(self) -> None:
+        in_raster = (self.var_in_raster.get() or "").strip()
+        if not in_raster or not os.path.exists(in_raster):
+            self._toast("Select a valid input raster", kind="error")
+            return
+        self.output_dir = self.output_dir or self.out_entry.get()
+        output_dir = (self.output_dir or "").strip()
+        if not output_dir:
+            self._invalidate_field(self.out_entry, msg="Select output directory")
+            self._toast("Please select an output directory", kind="error")
+            return
+
+        self._set_controls_state("disabled")
+        self.progress.configure(value=0, maximum=100)
+        self.eta.configure(text="")
+        self._set_status("Running pre-detection…")
+
+        start0 = time.time()
+
+        def cb(done: int, total: int, note: str = "") -> None:
+            msg = note or "Pre-detection"
+            self.after(0, self._update_progress, done, max(1, total), start0, msg)
+
+        def worker() -> None:
+            try:
+                result = run_predetection(
+                    in_raster=in_raster,
+                    output_root=output_dir,
+                    progress=cb,
+                )
+            except Exception as exc:
+                self.after(0, lambda: self._on_predetection_failed(str(exc)))
+                return
+            self.after(0, lambda: self._on_predetection_success(result))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ─────────── Segmentation ───────────
     def _on_run_workflow(self) -> None:
@@ -473,6 +519,28 @@ class ImageSelectorApp(ttk.Frame):
                 im.thumbnail((800, 600))
                 self._cm_photo = ImageTk.PhotoImage(im)
                 self.cm_label.configure(image=self._cm_photo)
+        except Exception:
+            pass
+
+    def _on_predetection_success(self, res: PreDetectionResult) -> None:
+        self._pred_path = str(res.vector_path)
+        self._set_controls_state("normal")
+        self._set_status(f"Pre-detection complete ({res.plot_count} plots)")
+        self._toast(f"Detected {res.plot_count} plots", kind="info")
+        try:
+            messagebox.showinfo(
+                "Pre-detection complete",
+                f"Detected {res.plot_count} plots.\nSaved to:\n{res.vector_path}\nSummary:\n{res.summary_path}",
+            )
+        except Exception:
+            pass
+
+    def _on_predetection_failed(self, msg: str) -> None:
+        self._set_controls_state("normal")
+        self._set_status(f"Pre-detection failed: {msg}")
+        self._toast("Pre-detection failed", kind="error")
+        try:
+            messagebox.showerror("Pre-detection failed", msg)
         except Exception:
             pass
 

@@ -13,6 +13,8 @@ from typing import Callable, Optional, Tuple
 import numpy as np
 import pandas as pd
 import rasterio
+from shapely.geometry import box
+from shapely.prepared import prep
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -77,6 +79,9 @@ def run_segmentation(
     tile_size_m: int = 40,
     spatialr: int = 5,
     minsize: int = 5,
+    aoi_path: Optional[str | os.PathLike] = None,
+    aoi_min_coverage: float = 0.05,
+    clip_to_aoi: bool = True,
     progress: Optional[ProgressCallback] = None,
 ) -> SegmentationResult:
     """
@@ -115,8 +120,29 @@ def run_segmentation(
         rows = math.ceil(H / tile_px)
         total = cols * rows
 
+        aoi_prepared = None
+        aoi_union = None
+        aoi_desc = None
+        if aoi_path:
+            try:
+                import geopandas as gpd
+                aoi_gdf = gpd.read_file(aoi_path)
+                if src.crs and aoi_gdf.crs and str(aoi_gdf.crs) != str(src.crs):
+                    aoi_gdf = aoi_gdf.to_crs(src.crs)
+                # Union all AOI geometries and prepare for fast intersection
+                aoi_union = aoi_gdf.unary_union
+                aoi_prepared = prep(aoi_union)
+                aoi_desc = f"AOI={os.path.basename(str(aoi_path))}"
+            except Exception:
+                aoi_prepared = None
+                aoi_union = None
+                aoi_desc = None
+
         if progress:
-            progress(0, total, "Initializing tiles…")
+            note0 = "Initializing tiles…"
+            if aoi_desc:
+                note0 += f" ({aoi_desc})"
+            progress(0, total, note0)
 
         for r in range(rows):
             for c in range(cols):
@@ -132,6 +158,25 @@ def run_segmentation(
 
                 window = rasterio.windows.Window(x0, y0, w, h)
                 transform = src.window_transform(window)
+
+                # Skip tiles outside AOI if provided
+                if aoi_prepared is not None:
+                    bounds = rasterio.windows.bounds(window, src.transform)
+                    tile_poly = box(*bounds)
+                    if not aoi_prepared.intersects(tile_poly):
+                        done += 1
+                        if progress:
+                            progress(done, total, "Skipping (outside AOI)")
+                        continue
+                    # Optional: require minimum coverage
+                    if aoi_union is not None:
+                        inter_area = tile_poly.intersection(aoi_union).area
+                        cov = inter_area / max(1e-9, tile_poly.area)
+                        if cov < max(0.0, float(aoi_min_coverage)):
+                            done += 1
+                            if progress:
+                                progress(done, total, f"Skipping (AOI<{aoi_min_coverage:.2f})")
+                            continue
 
                 ranger = _ranger_from_band1(src, window)
 
@@ -237,6 +282,15 @@ def run_segmentation(
                     continue
             if gdfs:
                 merged_gdf = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs if hasattr(gdfs[0], 'crs') else None)
+                # Optionally clip to AOI
+                if clip_to_aoi and aoi_path:
+                    try:
+                        aoi = gpd.read_file(aoi_path)
+                        if merged_gdf.crs and aoi.crs and str(merged_gdf.crs) != str(aoi.crs):
+                            aoi = aoi.to_crs(merged_gdf.crs)
+                        merged_gdf = gpd.overlay(merged_gdf, aoi, how='intersection')
+                    except Exception:
+                        pass
                 merged_gdf.to_file(out_shp)
                 merged = out_shp
         except Exception:

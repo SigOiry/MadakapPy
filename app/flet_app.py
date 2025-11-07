@@ -16,6 +16,7 @@ def run_flet_app() -> None:
         ) from e
 
     from .segmentation import run_segmentation
+    from .predetection import run_predetection
     from .classification import (
         train_model_from_training_polys,
         apply_model_with_pixel_sampling,
@@ -87,11 +88,18 @@ def run_flet_app() -> None:
         in_raster = ft.TextField(value=default_in, hint_text="Path to input GeoTIFF", expand=True)
         output_dir = ft.TextField(value=default_out, hint_text="Path to output directory", expand=True)
         otb_bin = ft.TextField(value=default_otb, hint_text="Path to OTB LargeScaleMeanShift (.bat/.exe)", expand=True)
+        pre_detect = ft.Checkbox(value=True, label="Pre‑detect cultivation plots (recommended)")
+        btn_predetect = ft.FilledButton(
+            "Run pre-detection",
+            icon=ft.icons.PLAY_CIRCLE,
+            on_click=lambda e: run_predetect_action(e),
+        )
 
         tile_size = ft.TextField(value="40", width=120)
         spatialr = ft.TextField(value="5", width=120)
         minsize = ft.TextField(value="5", width=120)
 
+        last_pred_path: Optional[str] = None
         # Mode selector: prefer SegmentedButton if available, else RadioGroup
         if hasattr(ft, "SegmentedButton"):
             mode = ft.SegmentedButton(
@@ -237,6 +245,52 @@ def run_flet_app() -> None:
                 step_text.value = f"Failed to read fields: {e}"
             page.update()
 
+        def run_predetect_action(_):
+            nonlocal last_pred_path
+            if not in_raster.value.strip():
+                step_text.value = "Please select an input raster"
+                page.update()
+                return
+            if not output_dir.value.strip():
+                step_text.value = "Please select an output directory"
+                page.update()
+                return
+
+            page.pubsub.send_all({"kind": "progress", "text": "Pre-detecting plots", "ratio": 0.0})
+
+            def worker_pd():
+                nonlocal last_pred_path
+                try:
+                    def cb_pd(done: int, total: int, note: str = ""):
+                        ratio = 0 if total == 0 else done / max(1, total)
+                        page.pubsub.send_all({
+                            "kind": "progress",
+                            "text": note or "Pre-detecting plots",
+                            "ratio": ratio,
+                        })
+
+                    res = run_predetection(
+                        in_raster=in_raster.value.strip(),
+                        output_root=output_dir.value.strip(),
+                        progress=cb_pd,
+                    )
+                    last_pred_path = str(res.vector_path)
+                    page.pubsub.send_all({
+                        "kind": "status",
+                        "text": f"Pre-detection complete ({res.plot_count} plots)",
+                    })
+                    page.pubsub.send_all({
+                        "kind": "result",
+                        "text": f"Pre-detection output: {res.vector_path}\nSummary: {res.summary_path}",
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    page.pubsub.send_all({
+                        "kind": "error",
+                        "text": f"Pre-detection failed: {exc}",
+                    })
+
+            threading.Thread(target=worker_pd, daemon=True).start()
+
         def run_workflow(_):
             # Validate inputs quickly
             if not in_raster.value.strip():
@@ -251,11 +305,38 @@ def run_flet_app() -> None:
             page.pubsub.send_all({"kind": "result", "text": ""})
 
             def worker():
+                nonlocal last_pred_path
                 try:
                     # Segmentation step
                     def cb(done: int, total: int, note: str = ""):
                         ratio = 0 if total == 0 else done / max(1, total)
                         page.pubsub.send_all({"kind": "progress", "text": f"Segmentation • {note}", "ratio": ratio})
+
+                    # Optional pre‑detection of plots
+                    aoi_for_run = None
+                    if pre_detect.value:
+                        try:
+                            def cb_pd(done: int, total: int, note: str = ""):
+                                ratio = 0 if total == 0 else done / max(1, total)
+                                page.pubsub.send_all({"kind": "progress", "text": note or "Pre‑detecting plots", "ratio": ratio})
+
+                            res_pd = run_predetection(
+                                in_raster=in_raster.value.strip(),
+                                output_root=output_dir.value.strip(),
+                                progress=cb_pd,
+                            )
+                            last_pred_path = str(res_pd.vector_path)
+                            page.pubsub.send_all({
+                                "kind": "result",
+                                "text": f"Pre-detection output: {res_pd.vector_path}\nSummary: {res_pd.summary_path}",
+                            })
+                            if res_pd.plot_count > 0:
+                                aoi_for_run = last_pred_path
+                                page.pubsub.send_all({"kind": "status", "text": f"Using {res_pd.plot_count} pre‑detected plots"})
+                            else:
+                                page.pubsub.send_all({"kind": "status", "text": "Pre‑detection produced no plots; using full extent"})
+                        except Exception as e:
+                            page.pubsub.send_all({"kind": "status", "text": f"Pre‑detection skipped: {e}"})
 
                     page.pubsub.send_all({"kind": "progress", "text": "Segmentation • starting", "ratio": 0.0})
                     seg_res = run_segmentation(
@@ -265,6 +346,9 @@ def run_flet_app() -> None:
                         tile_size_m=int(tile_size.value or 40),
                         spatialr=int(spatialr.value or 5),
                         minsize=int(minsize.value or 5),
+                        aoi_path=aoi_for_run,
+                        aoi_min_coverage=0.05,
+                        clip_to_aoi=True,
                         progress=cb,
                     )
                     page.pubsub.send_all({"kind": "progress", "text": "Segmentation • done", "ratio": 1.0})
@@ -335,13 +419,16 @@ def run_flet_app() -> None:
                     page.pubsub.send_all({"kind": "error", "text": str(ex)})
 
             threading.Thread(target=worker, daemon=True).start()
-
-        # Build UI layout
         left = section(
             "Project Paths",
             labeled_row("Input raster", ft.Row([in_raster, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_raster.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.IMAGE_OUTLINED),
             labeled_row("Output directory", ft.Row([output_dir, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER, on_click=lambda _: dp_output.get_directory_path())], expand=True), icon=ft.icons.FOLDER),
             labeled_row("OTB path", ft.Row([otb_bin, ft.OutlinedButton("Browse", icon=ft.icons.BUILD_OUTLINED, on_click=lambda _: fp_otb.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.BUILD_OUTLINED),
+            labeled_row(
+                "Plot pre‑detection",
+                ft.Row([pre_detect, btn_predetect], spacing=12),
+                icon=ft.icons.DETAILS,
+            ),
             icon=ft.icons.FOLDER_OPEN,
             subtitle="Select input data and where to write outputs.",
             bgcolor=_palette()["card"],
