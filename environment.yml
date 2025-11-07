@@ -16,3 +16,4 @@ dependencies:
   - rtree
   - matplotlib
   - flet
+  - folium

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 from pathlib import Path
@@ -30,14 +30,32 @@ def _ensure_temp(output_root: str | os.PathLike) -> Path:
 def detect_cultivation_plots(
     raster_path: str | os.PathLike,
     output_root: str | os.PathLike,
-    downscale_max: int = 1400,
-    min_region_px: int = 120,
-    merge_size_px: int = 2,
+    downscale_max: int = 1200,
+    min_region_px: int = 300,
+    merge_size_px: int = 3,
+    mask_mode: str = "and",  # 'and' or 'or'
+    orient_tolerance_deg: float = 12.0,
+    ar_min: float = 1.2,
+    ar_max: float = 12.0,
+    disable_filters: bool = False,
     width_m_range: tuple[float, float] | None = None,
     length_m_range: tuple[float, float] | None = None,
     area_m_min: float = 150.0,
     area_m_max: float | None = 900.0,
     blue_band_index: int | None = 1,
+    # New tunables
+    clahe_enable: bool = True,
+    clahe_clip: float = 2.0,
+    clahe_tile: int = 8,
+    texture_window: int = 10,
+    thr_relax_blue: float = 0.95,
+    thr_relax_tex: float = 0.90,
+    morph_close_radius: int = 1,
+    hole_area_frac: float = 0.4,
+    approx_epsilon_frac: float = 0.02,
+    fill_ratio_min: float = 0.35,
+    nms_iou_thresh: float = 0.25,
+    buffer_shrink: float = 0.05,
     progress: Optional[Progress] = None,
 ) -> Tuple[Path, int]:
     """
@@ -56,16 +74,23 @@ def detect_cultivation_plots(
     aoi_path = temp_dir / "plots_aoi.shp"
 
     if progress:
-        progress(0, 3, "Pre‑detecting plots: loading raster")
-
+        progress(0, 3, "Pre-detecting plots: loading raster")
     with rasterio.open(raster_path) as src:
         # Compute output size while keeping aspect ratio
         scale = min(downscale_max / src.width, downscale_max / src.height, 1.0)
         out_h = max(1, int(src.height * scale))
         out_w = max(1, int(src.width * scale))
 
-        # Always load bands 1,2,3 to build features (blue + texture from RGB)
-        idx = [1, 2, 3] if src.count >= 3 else [1]
+        # Load bands for features (ensure chosen blue band is included)
+        b_idx = int(blue_band_index or 1)
+        b_idx = max(1, min(src.count, b_idx))
+        if src.count >= 3:
+            base = [1, 2, 3]
+            if b_idx not in base:
+                base = [b_idx] + base[:2]
+            idx = base[:3]
+        else:
+            idx = [b_idx]
         arr = src.read(indexes=idx, out_shape=(len(idx), out_h, out_w), resampling=Resampling.bilinear).astype("float32")
 
         # Normalize per-band to 0..1 robustly
@@ -77,16 +102,21 @@ def detect_cultivation_plots(
                 vmax = vmin + 1.0
             arr[i] = np.clip((band - vmin) / (vmax - vmin), 0, 1)
 
-        # --- Two-band discrimination: (1) blue with mild contrast enhancement, (2) RGB texture (10x10 window) ---
-        # 1) Blue band with mild CLAHE
+        # --- Two-band discrimination: (1) blue with optional CLAHE, (2) RGB texture (configurable window) ---
+        # 1) Blue band with optional CLAHE
         blue = arr[0]
         blue8 = np.clip(blue * 255.0, 0, 255).astype(np.uint8)
         try:
-            blue_enh8 = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(blue8)
+            if bool(clahe_enable):
+                clip = float(max(0.1, clahe_clip))
+                tile = int(max(1, clahe_tile))
+                blue_enh8 = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile)).apply(blue8)
+            else:
+                blue_enh8 = blue8
         except Exception:
             blue_enh8 = blue8
 
-        # 2) Texture band as mean local std over bands 1,2,3 with 10x10 window
+        # 2) Texture band as mean local std over bands with configurable window
         def local_std(img: np.ndarray, k: int = 10) -> np.ndarray:
             img32 = img.astype(np.float32)
             ksz = (int(k), int(k))
@@ -95,11 +125,12 @@ def detect_cultivation_plots(
             var = np.maximum(m2 - m * m, 0.0)
             return np.sqrt(var)
 
+        win = int(max(3, texture_window))
         if arr.shape[0] >= 3:
-            stds = [local_std(arr[i], 10) for i in range(3)]
+            stds = [local_std(arr[i], win) for i in range(3)]
             tex = np.mean(stds, axis=0)
         else:
-            tex = local_std(arr[0], 10)
+            tex = local_std(arr[0], win)
         # Normalize texture to 0..1 robustly
         tmin = float(np.nanpercentile(tex, 2))
         tmax = float(np.nanpercentile(tex, 98))
@@ -110,27 +141,30 @@ def detect_cultivation_plots(
 
         # Combine both: dark in blue and sufficiently textured
         inv_blue8 = (255 - blue_enh8)
-        # Otsu thresholds with slight relaxation to include faded plots
+        # Otsu thresholds with configurable relaxation to include faded plots
         thr_b, _ = cv2.threshold(inv_blue8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Lower threshold a bit more to favor recall
-        thr_b = int(max(0, min(255, thr_b * 0.90)))
+        thr_b = int(max(0, min(255, thr_b * float(thr_relax_blue))))
         _, bin_b = cv2.threshold(inv_blue8, thr_b, 255, cv2.THRESH_BINARY)
 
         thr_t, _ = cv2.threshold(tex8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        thr_t = int(max(0, min(255, thr_t * 0.85)))
+        thr_t = int(max(0, min(255, thr_t * float(thr_relax_tex))))
         _, bin_t = cv2.threshold(tex8, thr_t, 255, cv2.THRESH_BINARY)
 
-        # Favor recall: union of evidence rather than intersection
-        bin_ = (bin_b > 0) | (bin_t > 0)
+        # Mask combination mode (AND conservative, OR permissive)
+        use_or = str(mask_mode).lower().strip() == "or"
+        bin_ = ((bin_b > 0) | (bin_t > 0)) if use_or else ((bin_b > 0) & (bin_t > 0))
         # Morphological cleanup
-        bin_ = closing(bin_.astype(bool), footprint=disk(max(1, int(merge_size_px))))
-        bin_ = remove_small_objects(bin_, min_size=min_region_px)
-        bin_ = remove_small_holes(bin_, area_threshold=int(min_region_px * 0.4))
+        rad = int(max(0, morph_close_radius))
+        if rad > 0:
+            bin_ = closing(bin_.astype(bool), footprint=disk(rad))
+        else:
+            bin_ = bin_.astype(bool)
+        bin_ = remove_small_objects(bin_, min_size=int(max(0, min_region_px)))
+        bin_ = remove_small_holes(bin_, area_threshold=int(max(0, hole_area_frac) * int(max(1, min_region_px))))
         mask = bin_.astype(np.uint8)
 
         if progress:
-            progress(2, 3, "Pre‑detecting plots: rectangle fitting")
-
+            progress(2, 3, "Pre-detecting plots: rectangle fitting")
         # Build transform for downscaled image
         scale_x = src.width / out_w
         scale_y = src.height / out_h
@@ -160,7 +194,7 @@ def detect_cultivation_plots(
 
         rect_polys: list[Polygon] = []
         angles: list[float] = []
-        RAW_MODE = False  # we will export raw separately but final AOI uses orientation-only filtering
+        RAW_MODE = bool(disable_filters)  # skip rectangle-level filters when disabling
         # First pass: gather rectangles with basic filters
         # Compute meters per pixel at the downscaled resolution
         px_m = abs(src.transform.a) * scale_x
@@ -170,9 +204,10 @@ def detect_cultivation_plots(
         for c in cnts:
             if len(c) < 5:
                 continue
-            # Prefer 4‑vertex polygons via approxPolyDP; fallback to minAreaRect
+            # Prefer 4-vertex polygons via approxPolyDP; fallback to minAreaRect
             per = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * per, True)
+            eps = float(max(0.0, approx_epsilon_frac)) * per
+            approx = cv2.approxPolyDP(c, eps, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
                 pts = approx.reshape(-1, 2).astype(np.float32)
                 # Compute rotated rectangle from polygon
@@ -188,12 +223,12 @@ def detect_cultivation_plots(
             long_side = max(w, h)
             short_side = max(1.0, min(w, h))
             ar = float(long_side / short_side)
-            # Cultivation plots elongated; prefer recall
-            if not RAW_MODE and (ar < 1.1 or ar > 20.0):
+            # Aspect ratio gate
+            if not RAW_MODE and (ar < float(ar_min) or ar > float(ar_max)):
                 continue
             ca = float(cv2.contourArea(c))
             fill = ca / rect_area
-            if not RAW_MODE and fill < 0.25:  # allow lighter/wispier regions
+            if not RAW_MODE and fill < float(fill_ratio_min):  # discard wispy regions
                 continue
             # Normalize angle so 0..90 is the orientation of the long side
             if w < h:
@@ -234,6 +269,13 @@ def detect_cultivation_plots(
         except Exception:
             pass
 
+        # If filters are disabled, return raw rectangles directly
+        if disable_filters:
+            gpd.GeoDataFrame(geometry=rect_polys, crs=src.crs).to_file(aoi_path)
+            if progress:
+                progress(3, 3, f"Pre-detected plots (raw): {len(rect_polys)}")
+            return aoi_path, len(rect_polys)
+
         if not rect_polys:
             # Fallback to mask vectorization
             geoms = []
@@ -255,8 +297,7 @@ def detect_cultivation_plots(
             gdf = gpd.GeoDataFrame(geometry=out_geoms, crs=src.crs)
             gdf.to_file(aoi_path)
             if progress:
-                progress(3, 3, f"Pre‑detected plots: {len(gdf)}")
-            return aoi_path, len(gdf)
+                progress(3, 3, f"Pre-detected plots: {len(gdf)}")
 
         # Filter rectangles by dominant orientation (only orientation gate)
         if angles:
@@ -264,10 +305,10 @@ def detect_cultivation_plots(
             hist, edges = np.histogram(angs, bins=12, range=(0, 90))
             dom_bin = int(np.argmax(hist))
             a0 = 0.5 * (edges[dom_bin] + edges[dom_bin + 1])
-            # Widen tolerance around dominant orientation
-            rect_polys = [p for p, ang in zip(rect_polys, angles) if abs(ang - a0) <= 20.0] or rect_polys
+            tol = float(max(0.0, orient_tolerance_deg))
+            rect_polys = [p for p, ang in zip(rect_polys, angles) if abs(ang - a0) <= tol] or rect_polys
 
-        # Non‑max suppression to avoid duplicates while keeping individual plots
+        # Non-max suppression to avoid duplicates while keeping individual plots
         def iou(a: Polygon, b: Polygon) -> float:
             inter = a.intersection(b).area
             if inter <= 0:
@@ -277,15 +318,13 @@ def detect_cultivation_plots(
         # NMS and export filtered set
         rect_polys_sorted = sorted(rect_polys, key=lambda p: p.area, reverse=True)
         kept: list[Polygon] = []
+        thr = float(max(0.0, min(1.0, nms_iou_thresh)))
         for p in rect_polys_sorted:
-            # Allow higher overlap to keep more candidates (favor recall)
-            if all(iou(p, q) < 0.60 for q in kept):
+            if all(iou(p, q) < thr for q in kept):
                 kept.append(p)
         try:
-            kept = [p.buffer(-0.05, join_style=2) if p.buffer(-0.05).area > 0 else p for p in kept]
-        except Exception:
-            pass
-        try:
+            shrink = float(max(0.0, buffer_shrink))
+            kept = [p.buffer(-shrink, join_style=2) if p.buffer(-shrink).area > 0 else p for p in kept]
             gpd.GeoDataFrame(geometry=kept, crs=src.crs).to_file(temp_dir / "plots_filtered.shp")
         except Exception:
             pass
@@ -293,8 +332,7 @@ def detect_cultivation_plots(
         gdf.to_file(aoi_path)
 
         if progress:
-            progress(3, 3, f"Pre‑detecting plots: {len(gdf)} polygons")
-
+            progress(3, 3, f"Pre-detecting plots: {len(gdf)} polygons")
         return aoi_path, len(gdf)
 
 
