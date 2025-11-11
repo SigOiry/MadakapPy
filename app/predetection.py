@@ -6,18 +6,23 @@ from typing import Callable, Optional, Tuple
 
 import numpy as np
 import rasterio
-from rasterio.enums import Resampling
 from rasterio.features import shapes
 from shapely.geometry import shape
 from shapely.ops import unary_union
 from shapely.geometry import Polygon, MultiPolygon
 import cv2
-from skimage.filters import gaussian
 from skimage.morphology import remove_small_objects, remove_small_holes, closing, disk
 
 import geopandas as gpd
 
 Progress = Callable[[int, int, str], None]
+
+_MIN_REGION_PX = 300
+_MORPH_CLOSE_RADIUS = 1
+_HOLE_AREA_FRAC = 0.4
+_APPROX_EPSILON_FRAC = 0.02
+_FILL_RATIO_MIN = 0.35
+_NMS_IOU_THRESH = 0.25
 
 
 def _ensure_temp(output_root: str | os.PathLike) -> Path:
@@ -30,41 +35,22 @@ def _ensure_temp(output_root: str | os.PathLike) -> Path:
 def detect_cultivation_plots(
     raster_path: str | os.PathLike,
     output_root: str | os.PathLike,
-    downscale_max: int = 1200,
-    min_region_px: int = 300,
-    merge_size_px: int = 3,
-    mask_mode: str = "and",  # 'and' or 'or'
+    min_width_m: float = 5.0,
+    max_width_m: float | None = 20.0,
+    min_length_m: float = 20.0,
+    max_length_m: float | None = 60.0,
+    small_polygon_buffer_m: float = 0.3,
+    blue_quantile: float = 0.15,
     orient_tolerance_deg: float = 12.0,
-    ar_min: float = 1.2,
-    ar_max: float = 12.0,
-    disable_filters: bool = False,
-    width_m_range: tuple[float, float] | None = None,
-    length_m_range: tuple[float, float] | None = None,
-    area_m_min: float = 150.0,
-    area_m_max: float | None = 900.0,
-    blue_band_index: int | None = 1,
-    # New tunables
-    clahe_enable: bool = True,
-    clahe_clip: float = 2.0,
-    clahe_tile: int = 8,
-    texture_window: int = 10,
-    thr_relax_blue: float = 0.95,
-    thr_relax_tex: float = 0.90,
-    morph_close_radius: int = 1,
-    hole_area_frac: float = 0.4,
-    approx_epsilon_frac: float = 0.02,
-    fill_ratio_min: float = 0.35,
-    nms_iou_thresh: float = 0.25,
-    buffer_shrink: float = 0.05,
     progress: Optional[Progress] = None,
 ) -> Tuple[Path, int]:
     """
-    Fast heuristic plot detector to build an AOI polygon file from the raster.
+    Fast heuristic plot detector that prepares AOI polygons from the raster.
 
-    - Downscales the image for speed
-    - Converts to grayscale and applies local thresholding
-    - Morphological cleanup and small region removal
-    - Vectorizes mask into polygons and writes a temporary AOI shapefile
+    - Uses the raw-resolution blue band (band 1) with percentile thresholding
+    - Applies a 5x5 focal (max) filter to build a candidate mask
+    - Morphological cleanup, contour fitting, and orientation gating
+    - Buffers/merges undersized polygons, filters by min area, and writes an AOI
 
     Returns (aoi_path, polygon_count).
     """
@@ -73,118 +59,72 @@ def detect_cultivation_plots(
     temp_dir = _ensure_temp(output_root)
     aoi_path = temp_dir / "plots_aoi.shp"
 
+    min_width = max(0.0, float(min_width_m))
+    min_length = max(0.0, float(min_length_m))
+    max_width = float(max_width_m) if (max_width_m is not None and float(max_width_m) > 0) else None
+    max_length = float(max_length_m) if (max_length_m is not None and float(max_length_m) > 0) else None
+    blue_quantile = float(np.clip(blue_quantile, 0.0, 1.0))
+    min_area_m = (min_width * min_length) if (min_width > 0 and min_length > 0) else 0.0
+    small_buffer = max(0.0, float(small_polygon_buffer_m))
+
     if progress:
         progress(0, 3, "Pre-detecting plots: loading raster")
     with rasterio.open(raster_path) as src:
-        # Compute output size while keeping aspect ratio
-        scale = min(downscale_max / src.width, downscale_max / src.height, 1.0)
-        out_h = max(1, int(src.height * scale))
-        out_w = max(1, int(src.width * scale))
-
-        # Load bands for features (ensure chosen blue band is included)
-        b_idx = int(blue_band_index or 1)
-        b_idx = max(1, min(src.count, b_idx))
-        if src.count >= 3:
-            base = [1, 2, 3]
-            if b_idx not in base:
-                base = [b_idx] + base[:2]
-            idx = base[:3]
+        # Load blue band (band 1) at full resolution
+        b_idx = 1 if src.count >= 1 else src.count
+        arr = src.read(b_idx, masked=True)
+        if np.ma.isMaskedArray(arr):
+            blue = np.asarray(arr.filled(np.nan), dtype=np.float32)
         else:
-            idx = [b_idx]
-        arr = src.read(indexes=idx, out_shape=(len(idx), out_h, out_w), resampling=Resampling.bilinear).astype("float32")
+            blue = arr.astype(np.float32)
 
-        # Normalize per-band to 0..1 robustly
-        for i in range(arr.shape[0]):
-            band = arr[i]
-            vmin = np.nanpercentile(band, 2)
-            vmax = np.nanpercentile(band, 98)
-            if vmax <= vmin:
-                vmax = vmin + 1.0
-            arr[i] = np.clip((band - vmin) / (vmax - vmin), 0, 1)
+        # Treat zero values as no-data before computing the percentile
+        zero_mask = blue == 0
+        if np.any(zero_mask):
+            blue[zero_mask] = np.nan
+        if not np.isfinite(blue).any():
+            raise ValueError("Blue band contains only zero or no-data values.")
 
-        # --- Two-band discrimination: (1) blue with optional CLAHE, (2) RGB texture (configurable window) ---
-        # 1) Blue band with optional CLAHE
-        blue = arr[0]
-        blue8 = np.clip(blue * 255.0, 0, 255).astype(np.uint8)
-        try:
-            if bool(clahe_enable):
-                clip = float(max(0.1, clahe_clip))
-                tile = int(max(1, clahe_tile))
-                blue_enh8 = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile)).apply(blue8)
-            else:
-                blue_enh8 = blue8
-        except Exception:
-            blue_enh8 = blue8
+        percentile = float(blue_quantile * 100.0)
+        p80_val = float(np.nanpercentile(blue, percentile))
+        valid_mask = np.isfinite(blue)
+        filtered = np.zeros_like(blue, dtype=np.uint8)
+        filtered[valid_mask] = (blue[valid_mask] < p80_val).astype(np.uint8)
 
-        # 2) Texture band as mean local std over bands with configurable window
-        def local_std(img: np.ndarray, k: int = 10) -> np.ndarray:
-            img32 = img.astype(np.float32)
-            ksz = (int(k), int(k))
-            m = cv2.boxFilter(img32, ddepth=-1, ksize=ksz, normalize=True)
-            m2 = cv2.boxFilter(img32 * img32, ddepth=-1, ksize=ksz, normalize=True)
-            var = np.maximum(m2 - m * m, 0.0)
-            return np.sqrt(var)
+        # 5x5 focal max filter (equivalent to terra::focal(..., fun='max'))
+        kernel = np.ones((5, 5), dtype=np.uint8)
+        foc = cv2.dilate(filtered, kernel)
+        foc = (foc > 0).astype(np.uint8)
+        foc_raster = foc.copy()
 
-        win = int(max(3, texture_window))
-        if arr.shape[0] >= 3:
-            stds = [local_std(arr[i], win) for i in range(3)]
-            tex = np.mean(stds, axis=0)
-        else:
-            tex = local_std(arr[0], win)
-        # Normalize texture to 0..1 robustly
-        tmin = float(np.nanpercentile(tex, 2))
-        tmax = float(np.nanpercentile(tex, 98))
-        if tmax <= tmin:
-            tmax = tmin + 1.0
-        tex_norm = np.clip((tex - tmin) / (tmax - tmin), 0.0, 1.0)
-        tex8 = np.clip(tex_norm * 255.0, 0, 255).astype(np.uint8)
-
-        # Combine both: dark in blue and sufficiently textured
-        inv_blue8 = (255 - blue_enh8)
-        # Otsu thresholds with configurable relaxation to include faded plots
-        thr_b, _ = cv2.threshold(inv_blue8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        thr_b = int(max(0, min(255, thr_b * float(thr_relax_blue))))
-        _, bin_b = cv2.threshold(inv_blue8, thr_b, 255, cv2.THRESH_BINARY)
-
-        thr_t, _ = cv2.threshold(tex8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        thr_t = int(max(0, min(255, thr_t * float(thr_relax_tex))))
-        _, bin_t = cv2.threshold(tex8, thr_t, 255, cv2.THRESH_BINARY)
-
-        # Mask combination mode (AND conservative, OR permissive)
-        use_or = str(mask_mode).lower().strip() == "or"
-        bin_ = ((bin_b > 0) | (bin_t > 0)) if use_or else ((bin_b > 0) & (bin_t > 0))
-        # Morphological cleanup
-        rad = int(max(0, morph_close_radius))
-        if rad > 0:
-            bin_ = closing(bin_.astype(bool), footprint=disk(rad))
-        else:
-            bin_ = bin_.astype(bool)
-        bin_ = remove_small_objects(bin_, min_size=int(max(0, min_region_px)))
-        bin_ = remove_small_holes(bin_, area_threshold=int(max(0, hole_area_frac) * int(max(1, min_region_px))))
+        # Continue workflow from the focal output
+        bin_ = foc.astype(bool)
+        if _MORPH_CLOSE_RADIUS > 0:
+            bin_ = closing(bin_, footprint=disk(_MORPH_CLOSE_RADIUS))
+        bin_ = remove_small_objects(bin_, min_size=int(_MIN_REGION_PX))
+        hole_area_thresh = max(1, int(_MIN_REGION_PX * _HOLE_AREA_FRAC))
+        bin_ = remove_small_holes(bin_, area_threshold=hole_area_thresh)
         mask = bin_.astype(np.uint8)
 
         if progress:
             progress(2, 3, "Pre-detecting plots: rectangle fitting")
-        # Build transform for downscaled image
-        scale_x = src.width / out_w
-        scale_y = src.height / out_h
-        transform = src.transform * rasterio.Affine.scale(scale_x, scale_y)
+        transform = src.transform
 
-        # Save QA image (enhanced blue) next to temp AOI
+        # Export the focal mask for QA
         try:
-            blur_path = temp_dir / "plots_blur.tif"
+            foc_path = temp_dir / "plots_foc.tif"
             with rasterio.open(
-                blur_path,
+                foc_path,
                 "w",
                 driver="GTiff",
-                height=out_h,
-                width=out_w,
+                height=src.height,
+                width=src.width,
                 count=1,
                 dtype="uint8",
                 crs=src.crs,
                 transform=transform,
             ) as dst:
-                dst.write(blue_enh8, 1)
+                dst.write(foc_raster, 1)
         except Exception:
             pass
 
@@ -192,92 +132,68 @@ def detect_cultivation_plots(
         bin8 = (mask.astype(np.uint8) * 255)
         cnts, _ = cv2.findContours(bin8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        rect_polys: list[Polygon] = []
-        angles: list[float] = []
-        RAW_MODE = bool(disable_filters)  # skip rectangle-level filters when disabling
-        # First pass: gather rectangles with basic filters
-        # Compute meters per pixel at the downscaled resolution
-        px_m = abs(src.transform.a) * scale_x
-        py_m = abs(src.transform.e) * scale_y if hasattr(src.transform, 'e') else abs(src.transform.a) * scale_y
+        rect_records: list[dict] = []
+        px_m = abs(src.transform.a)
+        py_m = abs(getattr(src.transform, "e", src.transform.a))
         avg_mpp = float((px_m + py_m) / 2.0)
 
         for c in cnts:
             if len(c) < 5:
                 continue
-            # Prefer 4-vertex polygons via approxPolyDP; fallback to minAreaRect
             per = cv2.arcLength(c, True)
-            eps = float(max(0.0, approx_epsilon_frac)) * per
+            eps = float(_APPROX_EPSILON_FRAC) * per
             approx = cv2.approxPolyDP(c, eps, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
                 pts = approx.reshape(-1, 2).astype(np.float32)
-                # Compute rotated rectangle from polygon
                 rect = cv2.minAreaRect(pts)
             else:
                 rect = cv2.minAreaRect(c)
-            (cx, cy), (w, h), ang = rect
+            (_cx, _cy), (w, h), ang = rect
             if w <= 1 or h <= 1:
                 continue
             rect_area = float(w * h)
-            if not RAW_MODE and rect_area < float(min_region_px):
-                continue
-            long_side = max(w, h)
-            short_side = max(1.0, min(w, h))
-            ar = float(long_side / short_side)
-            # Aspect ratio gate
-            if not RAW_MODE and (ar < float(ar_min) or ar > float(ar_max)):
-                continue
             ca = float(cv2.contourArea(c))
-            fill = ca / rect_area
-            if not RAW_MODE and fill < float(fill_ratio_min):  # discard wispy regions
+            fill = ca / rect_area if rect_area > 0 else 0.0
+            if fill < float(_FILL_RATIO_MIN):
                 continue
-            # Normalize angle so 0..90 is the orientation of the long side
             if w < h:
                 ang = ang + 90.0
             ang = abs(ang) % 90.0
 
-            # Physical dimension filtering (meters)
+            long_side = max(w, h)
+            short_side = max(1.0, min(w, h))
             long_m = float(long_side) * avg_mpp
             short_m = float(short_side) * avg_mpp
-            # Ensure long_m >= short_m
             if short_m > long_m:
                 long_m, short_m = short_m, long_m
-            # Area/size filters (disabled in RAW_MODE)
-            if not RAW_MODE:
-                area_m = (float(rect_area) * (avg_mpp ** 2))
-                if area_m < float(area_m_min):
-                    continue
-                if area_m_max is not None and area_m > float(area_m_max):
-                    continue
-                if width_m_range is not None:
-                    wmin, wmax = width_m_range
-                    if not (wmin <= short_m <= wmax):
-                        continue
-                if length_m_range is not None:
-                    lmin, lmax = length_m_range
-                    if not (lmin <= long_m <= lmax):
-                        continue
-            angles.append(ang)
-            # Convert rect to polygon in pixel space then to map coordinates
-            box_pts = cv2.boxPoints(rect)  # (x,y)
-            # Re-orient to represent the long side consistently
-            pts_xy = [transform * (float(px), float(py)) for px, py in box_pts]
-            rect_polys.append(Polygon(pts_xy))
 
-        # Export raw rectangles before any orientation filtering
+            size_ok = True
+            if min_width > 0 and short_m < min_width:
+                size_ok = False
+            if min_length > 0 and long_m < min_length:
+                size_ok = False
+            if max_width is not None and short_m > max_width:
+                size_ok = False
+            if max_length is not None and long_m > max_length:
+                size_ok = False
+
+            box_pts = cv2.boxPoints(rect)
+            pts_xy = [transform * (float(px), float(py)) for px, py in box_pts]
+            rect_records.append(
+                {
+                    "geometry": Polygon(pts_xy),
+                    "angle": ang,
+                    "size_ok": size_ok,
+                }
+            )
+
+        raw_polys = [rec["geometry"] for rec in rect_records]
         try:
-            gpd.GeoDataFrame(geometry=rect_polys, crs=src.crs).to_file(temp_dir / "plots_raw.shp")
+            gpd.GeoDataFrame(geometry=raw_polys, crs=src.crs).to_file(temp_dir / "plots_raw.shp")
         except Exception:
             pass
 
-        # If filters are disabled, return raw rectangles directly
-        if disable_filters:
-            gpd.GeoDataFrame(geometry=rect_polys, crs=src.crs).to_file(aoi_path)
-            if progress:
-                progress(3, 3, f"Pre-detected plots (raw): {len(rect_polys)}")
-            return aoi_path, len(rect_polys)
-
-        if not rect_polys:
-            # Fallback to mask vectorization
+        if not rect_records:
             geoms = []
             for geom, val in shapes(mask.astype(np.uint8), mask=None, transform=transform):
                 if int(val) == 1:
@@ -294,41 +210,68 @@ def detect_cultivation_plots(
                 out_geoms = list(merged.geoms)
             else:
                 out_geoms = list(getattr(merged, "geoms", [merged]))
+            if min_area_m > 0:
+                out_geoms = [g for g in out_geoms if g.area >= min_area_m]
             gdf = gpd.GeoDataFrame(geometry=out_geoms, crs=src.crs)
             gdf.to_file(aoi_path)
             if progress:
                 progress(3, 3, f"Pre-detected plots: {len(gdf)}")
+            return aoi_path, len(gdf)
 
-        # Filter rectangles by dominant orientation (only orientation gate)
-        if angles:
-            angs = np.array(angles)
+        orientation_pool = [rec for rec in rect_records if rec["size_ok"]] or rect_records
+        dom_angle = None
+        tol = float(max(0.0, orient_tolerance_deg))
+        if orientation_pool:
+            angs = np.array([rec["angle"] for rec in orientation_pool])
             hist, edges = np.histogram(angs, bins=12, range=(0, 90))
             dom_bin = int(np.argmax(hist))
-            a0 = 0.5 * (edges[dom_bin] + edges[dom_bin + 1])
-            tol = float(max(0.0, orient_tolerance_deg))
-            rect_polys = [p for p, ang in zip(rect_polys, angles) if abs(ang - a0) <= tol] or rect_polys
+            dom_angle = 0.5 * (edges[dom_bin] + edges[dom_bin + 1])
 
-        # Non-max suppression to avoid duplicates while keeping individual plots
+        oriented_polys = raw_polys
+        if dom_angle is not None:
+            oriented_polys = [rec["geometry"] for rec in rect_records if abs(rec["angle"] - dom_angle) <= tol] or raw_polys
+
         def iou(a: Polygon, b: Polygon) -> float:
             inter = a.intersection(b).area
             if inter <= 0:
                 return 0.0
             return inter / (a.union(b).area)
 
-        # NMS and export filtered set
-        rect_polys_sorted = sorted(rect_polys, key=lambda p: p.area, reverse=True)
+        rect_polys_sorted = sorted(oriented_polys, key=lambda p: p.area, reverse=True)
         kept: list[Polygon] = []
-        thr = float(max(0.0, min(1.0, nms_iou_thresh)))
+        thr = float(max(0.0, min(1.0, _NMS_IOU_THRESH)))
         for p in rect_polys_sorted:
             if all(iou(p, q) < thr for q in kept):
                 kept.append(p)
+
+        adjusted: list[Polygon] = []
+        for poly in kept:
+            geom = poly
+            if min_area_m > 0 and geom.area < min_area_m and small_buffer > 0:
+                buffered = geom.buffer(small_buffer, join_style=2)
+                if buffered.area > 0:
+                    geom = buffered
+            adjusted.append(geom)
+
+        merged_polys: list[Polygon] = []
+        if adjusted:
+            merged_geom = unary_union(adjusted)
+            if isinstance(merged_geom, Polygon):
+                merged_polys = [merged_geom]
+            elif isinstance(merged_geom, MultiPolygon):
+                merged_polys = list(merged_geom.geoms)
+            else:
+                merged_polys = list(getattr(merged_geom, "geoms", []))
+
+        final_polys: list[Polygon] = merged_polys or []
+        if min_area_m > 0:
+            final_polys = [poly for poly in final_polys if poly.area >= min_area_m]
+
         try:
-            shrink = float(max(0.0, buffer_shrink))
-            kept = [p.buffer(-shrink, join_style=2) if p.buffer(-shrink).area > 0 else p for p in kept]
-            gpd.GeoDataFrame(geometry=kept, crs=src.crs).to_file(temp_dir / "plots_filtered.shp")
+            gpd.GeoDataFrame(geometry=final_polys, crs=src.crs).to_file(temp_dir / "plots_filtered.shp")
         except Exception:
             pass
-        gdf = gpd.GeoDataFrame(geometry=kept, crs=src.crs)
+        gdf = gpd.GeoDataFrame(geometry=final_polys, crs=src.crs)
         gdf.to_file(aoi_path)
 
         if progress:
@@ -360,8 +303,9 @@ def save_preselection_to_output(
         p = src.with_suffix(ext)
         if p.exists():
             shutil.copy2(p, run_dir / p.name)
-    # Also copy QA blurred TIFF if present in temp
-    blur = src.parent / "plots_blur.tif"
-    if blur.exists():
-        shutil.copy2(blur, run_dir / "plots_blur.tif")
+    # Also copy QA rasters (focal mask + legacy blur) if present in temp
+    for extra in ("plots_foc.tif", "plots_blur.tif"):
+        extra_src = src.parent / extra
+        if extra_src.exists():
+            shutil.copy2(extra_src, run_dir / extra_src.name)
     return run_dir / (stem + ".shp")

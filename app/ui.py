@@ -59,17 +59,13 @@ class ImageSelectorApp(ttk.Frame):
         self.var_max_pixels_per_class = tk.IntVar(value=0)  # 0 = no cap
         self.var_max_pixels_per_polygon = tk.IntVar(value=200)
 
-        # Preselection parameters
-        self.var_pre_mask_mode = tk.StringVar(value="and")  # 'and' or 'or'
-        self.var_pre_min_region_px = tk.IntVar(value=300)
-        self.var_pre_ar_min = tk.DoubleVar(value=1.2)
-        self.var_pre_ar_max = tk.DoubleVar(value=12.0)
-        self.var_pre_orient_tol = tk.DoubleVar(value=12.0)
-        self.var_pre_wmin = tk.DoubleVar(value=5.0)
-        self.var_pre_wmax = tk.DoubleVar(value=20.0)
-        self.var_pre_lmin = tk.DoubleVar(value=20.0)
-        self.var_pre_lmax = tk.DoubleVar(value=60.0)
-        self.var_pre_disable_filters = tk.BooleanVar(value=False)
+        # Preselection parameters (size-driven)
+        self.var_pre_wmin = tk.StringVar(value="5")
+        self.var_pre_wmax = tk.StringVar(value="20")
+        self.var_pre_lmin = tk.StringVar(value="20")
+        self.var_pre_lmax = tk.StringVar(value="60")
+        self.var_pre_small_buffer = tk.StringVar(value="0.3")
+        self.var_pre_quantile = tk.DoubleVar(value=0.15)
 
         self._build()
 
@@ -140,41 +136,38 @@ class ImageSelectorApp(ttk.Frame):
         # Preselection params
         pre = ttk.LabelFrame(left, text="Preselection (AOI detection)", style="Section.TLabelframe")
         pre.grid(row=1, column=0, sticky="we", pady=(0,8))
-        for i in range(8):
+        for i in range(4):
             pre.columnconfigure(i, weight=1)
-        # Disable-all-filters checkbox
-        chk = ttk.Checkbutton(pre, text="Disable all filters (raw)", variable=self.var_pre_disable_filters, command=self._update_pre_controls_state)
-        chk.grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        ttk.Label(pre, text="Mask mode").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        rb_and = ttk.Radiobutton(pre, text="AND", variable=self.var_pre_mask_mode, value="and")
-        rb_or = ttk.Radiobutton(pre, text="OR", variable=self.var_pre_mask_mode, value="or")
-        rb_and.grid(row=0, column=1, sticky="w", padx=6)
-        rb_or.grid(row=0, column=2, sticky="w", padx=6)
-        ttk.Label(pre, text="Min region (px)").grid(row=0, column=3, sticky="w", padx=8)
-        ent_minreg = ttk.Entry(pre, textvariable=self.var_pre_min_region_px, width=10)
-        ent_minreg.grid(row=0, column=4, sticky="w", padx=6)
-        ttk.Label(pre, text="AR min").grid(row=1, column=0, sticky="w", padx=8)
-        ent_armin = ttk.Entry(pre, textvariable=self.var_pre_ar_min, width=8)
-        ent_armin.grid(row=1, column=1, sticky="w", padx=6)
-        ttk.Label(pre, text="AR max").grid(row=1, column=2, sticky="w", padx=8)
-        ent_armax = ttk.Entry(pre, textvariable=self.var_pre_ar_max, width=8)
-        ent_armax.grid(row=1, column=3, sticky="w", padx=6)
-        ttk.Label(pre, text="Orient tol (deg)").grid(row=1, column=4, sticky="w", padx=8)
-        ent_orient = ttk.Entry(pre, textvariable=self.var_pre_orient_tol, width=8)
-        ent_orient.grid(row=1, column=5, sticky="w", padx=6)
-        ttk.Label(pre, text="Width m [min,max]").grid(row=2, column=0, sticky="w", padx=8)
-        ent_wmin = ttk.Entry(pre, textvariable=self.var_pre_wmin, width=8)
-        ent_wmax = ttk.Entry(pre, textvariable=self.var_pre_wmax, width=8)
-        ent_wmin.grid(row=2, column=1, sticky="w", padx=6)
-        ent_wmax.grid(row=2, column=2, sticky="w", padx=6)
-        ttk.Label(pre, text="Length m [min,max]").grid(row=2, column=3, sticky="w", padx=8)
-        ent_lmin = ttk.Entry(pre, textvariable=self.var_pre_lmin, width=8)
-        ent_lmax = ttk.Entry(pre, textvariable=self.var_pre_lmax, width=8)
-        ent_lmin.grid(row=2, column=4, sticky="w", padx=6)
-        ent_lmax.grid(row=2, column=5, sticky="w", padx=6)
+        ttk.Label(pre, text="Use plot sizes (meters) to orient and merge polygons. Leave max values blank if unknown.", wraplength=360).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(6, 4)
+        )
+        ttk.Label(pre, text="Min width (m)").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(pre, textvariable=self.var_pre_wmin, width=10).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(pre, text="Max width (m)").grid(row=1, column=2, sticky="w", padx=8, pady=4)
+        ttk.Entry(pre, textvariable=self.var_pre_wmax, width=10).grid(row=1, column=3, sticky="w", padx=6, pady=4)
 
-        # Store refs for enabling/disabling
-        self._pre_controls = [rb_and, rb_or, ent_minreg, ent_armin, ent_armax, ent_orient, ent_wmin, ent_wmax, ent_lmin, ent_lmax]
+        ttk.Label(pre, text="Min length (m)").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(pre, textvariable=self.var_pre_lmin, width=10).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(pre, text="Max length (m)").grid(row=2, column=2, sticky="w", padx=8, pady=4)
+        ttk.Entry(pre, textvariable=self.var_pre_lmax, width=10).grid(row=2, column=3, sticky="w", padx=6, pady=4)
+
+        ttk.Label(pre, text="Small-plot buffer (m)").grid(row=3, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(pre, textvariable=self.var_pre_small_buffer, width=10).grid(row=3, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(pre, text="Blue quantile").grid(row=4, column=0, sticky="w", padx=8, pady=4)
+        quant_frame = ttk.Frame(pre)
+        quant_frame.grid(row=4, column=1, columnspan=3, sticky="we", padx=6, pady=4)
+        quant_frame.columnconfigure(0, weight=1)
+        self.lbl_quantile_val = ttk.Label(quant_frame, text=f"{self.var_pre_quantile.get():.2f}")
+        scale = ttk.Scale(
+            quant_frame,
+            from_=0.05,
+            to=0.9,
+            orient=tk.HORIZONTAL,
+            variable=self.var_pre_quantile,
+            command=lambda v: self.lbl_quantile_val.configure(text=f"{float(v):.2f}"),
+        )
+        scale.grid(row=0, column=0, sticky="we", padx=(0, 8))
+        self.lbl_quantile_val.grid(row=0, column=1, sticky="e")
 
         # Segmentation params
         seg = ttk.LabelFrame(left, text="Segmentation (LargeScaleMeanShift)", style="Section.TLabelframe")
@@ -379,27 +372,21 @@ class ImageSelectorApp(ttk.Frame):
 
             # Step 0: preselection (AOI)
             try:
-                # Collect optional ranges
-                def rng(vmin, vmax):
-                    try:
-                        a = float(vmin)
-                        b = float(vmax)
-                        return (a, b) if a > 0 and b > 0 and b >= a else None
-                    except Exception:
-                        return None
-                width_rng = rng(self.var_pre_wmin.get(), self.var_pre_wmax.get())
-                length_rng = rng(self.var_pre_lmin.get(), self.var_pre_lmax.get())
+                min_w = self._parse_optional_float(self.var_pre_wmin.get(), 0.0) or 0.0
+                max_w = self._parse_optional_float(self.var_pre_wmax.get())
+                min_l = self._parse_optional_float(self.var_pre_lmin.get(), 0.0) or 0.0
+                max_l = self._parse_optional_float(self.var_pre_lmax.get())
+                small_buf = self._parse_optional_float(self.var_pre_small_buffer.get(), 0.3)
+                quant = max(0.0, min(1.0, float(self.var_pre_quantile.get() or 0.15)))
                 aoi_temp, n_polys = detect_cultivation_plots(
                     raster_path=session.seg_in_raster,
                     output_root=session.output_dir,
-                    min_region_px=int(self.var_pre_min_region_px.get()),
-                    mask_mode=self.var_pre_mask_mode.get(),
-                    disable_filters=bool(self.var_pre_disable_filters.get()),
-                    orient_tolerance_deg=float(self.var_pre_orient_tol.get()),
-                    ar_min=float(self.var_pre_ar_min.get()),
-                    ar_max=float(self.var_pre_ar_max.get()),
-                    width_m_range=width_rng,
-                    length_m_range=length_rng,
+                    min_width_m=min_w,
+                    max_width_m=max_w,
+                    min_length_m=min_l,
+                    max_length_m=max_l,
+                    small_polygon_buffer_m=small_buf,
+                    blue_quantile=quant,
                     progress=make_cb("Preselection"),
                 )
                 aoi_final = save_preselection_to_output(aoi_temp, session.output_dir)
@@ -554,25 +541,21 @@ class ImageSelectorApp(ttk.Frame):
             def cb(done: int, total: int, note: str = ""):
                 self.after(0, self._update_progress, done, max(1, total), start0, note or "Preselection")
             try:
+                min_w = self._parse_optional_float(self.var_pre_wmin.get(), 0.0) or 0.0
+                max_w = self._parse_optional_float(self.var_pre_wmax.get())
+                min_l = self._parse_optional_float(self.var_pre_lmin.get(), 0.0) or 0.0
+                max_l = self._parse_optional_float(self.var_pre_lmax.get())
+                small_buf = self._parse_optional_float(self.var_pre_small_buffer.get(), 0.3)
+                quant = max(0.0, min(1.0, float(self.var_pre_quantile.get() or 0.15)))
                 aoi_temp, n_polys = detect_cultivation_plots(
                     raster_path=in_raster,
                     output_root=self.output_dir,
-                    min_region_px=int(self.var_pre_min_region_px.get()),
-                    mask_mode=self.var_pre_mask_mode.get(),
-                    disable_filters=bool(self.var_pre_disable_filters.get()),
-                    orient_tolerance_deg=float(self.var_pre_orient_tol.get()),
-                    ar_min=float(self.var_pre_ar_min.get()),
-                    ar_max=float(self.var_pre_ar_max.get()),
-                    width_m_range=(
-                        (float(self.var_pre_wmin.get()), float(self.var_pre_wmax.get()))
-                        if self.var_pre_wmin.get() and self.var_pre_wmax.get() and float(self.var_pre_wmax.get() or 0) >= float(self.var_pre_wmin.get() or 0)
-                        else None
-                    ),
-                    length_m_range=(
-                        (float(self.var_pre_lmin.get()), float(self.var_pre_lmax.get()))
-                        if self.var_pre_lmin.get() and self.var_pre_lmax.get() and float(self.var_pre_lmax.get() or 0) >= float(self.var_pre_lmin.get() or 0)
-                        else None
-                    ),
+                    min_width_m=min_w,
+                    max_width_m=max_w,
+                    min_length_m=min_l,
+                    max_length_m=max_l,
+                    small_polygon_buffer_m=small_buf,
+                    blue_quantile=quant,
                     progress=cb,
                 )
                 aoi_final = save_preselection_to_output(aoi_temp, self.output_dir)
@@ -587,13 +570,12 @@ class ImageSelectorApp(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _update_pre_controls_state(self) -> None:
-        disabled = ("disabled" if self.var_pre_disable_filters.get() else "normal")
-        for w in getattr(self, "_pre_controls", []):
-            try:
-                w.configure(state=disabled)
-            except Exception:
-                pass
+    @staticmethod
+    def _parse_optional_float(value: str | None, default: float | None = None) -> float | None:
+        txt = (value or "").strip()
+        if not txt:
+            return default
+        return float(txt)
 
     def _blocking_dialog(self, func):
         # Run a filedialog-like function in the main thread and wait for its result

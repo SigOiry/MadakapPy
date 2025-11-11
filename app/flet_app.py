@@ -218,39 +218,44 @@ def run_flet_app() -> None:
         output_dir = ft.TextField(value=default_out, expand=True)
         otb_bin = ft.TextField(value=default_otb, expand=True)
 
-        # Preselection controls (with requested defaults)
-        pre_disable_filters = ft.Checkbox(label="Disable filters (raw)", value=False)
-        pre_disable_filters.tooltip = "Bypass all polygon filters; export raw rectangles."
-        pre_mask_mode = ft.Dropdown(options=[ft.dropdown.Option("and"), ft.dropdown.Option("or")], value="and", width=140)
-        pre_min_region = ft.TextField(value="300", width=120)
-        pre_ar_min = ft.TextField(value="1.2", width=120)
-        pre_ar_max = ft.TextField(value="12.0", width=120)
-        pre_orient_tol = ft.TextField(value="12", width=120)
-        pre_wmin = ft.TextField(value="5", width=120)
-        pre_wmax = ft.TextField(value="20", width=120)
-        pre_lmin = ft.TextField(value="20", width=120)
-        pre_lmax = ft.TextField(value="60", width=120)
-        # Image transform & detection tunables
-        pre_downscale = ft.TextField(value="1200", width=120)
-        pre_blue_band = ft.TextField(value="1", width=100)
-        pre_clahe_enable = ft.Checkbox(label="CLAHE", value=True)
-        pre_clahe_enable.tooltip = "Enable local-contrast enhancement (CLAHE)."
-        pre_clahe_clip = ft.TextField(value="2.0", width=100)
-        pre_clahe_tile = ft.TextField(value="8", width=100)
-        pre_tex_win = ft.TextField(value="10", width=100)
-        pre_thr_b_relax = ft.TextField(value="0.95", width=100)
-        pre_thr_t_relax = ft.TextField(value="0.90", width=100)
-        pre_morph_radius = ft.TextField(value="1", width=100)
-        pre_hole_frac = ft.TextField(value="0.4", width=100)
-        pre_approx_eps = ft.TextField(value="0.02", width=100)
-        pre_fill_min = ft.TextField(value="0.35", width=100)
-        pre_nms_iou = ft.TextField(value="0.25", width=100)
-        pre_buf_shrink = ft.TextField(value="0.05", width=100)
+        # Preselection controls (size-only workflow)
+        pre_wmin = ft.TextField(value="5", width=120, text_align=ft.TextAlign.RIGHT)
+        pre_wmax = ft.TextField(value="20", width=120, text_align=ft.TextAlign.RIGHT, hint_text="Optional")
+        pre_lmin = ft.TextField(value="20", width=120, text_align=ft.TextAlign.RIGHT)
+        pre_lmax = ft.TextField(value="60", width=120, text_align=ft.TextAlign.RIGHT, hint_text="Optional")
+        pre_small_buffer = ft.TextField(value="0.3", width=140, text_align=ft.TextAlign.RIGHT, hint_text="Buffer (m)")
+        pre_quantile = ft.Slider(min=0.05, max=0.9, value=0.15, divisions=17, expand=True)
+        pre_quantile_label = ft.Text("", color=pal["muted"])
+
+        def _update_quant_label(val: float | None) -> None:
+            pre_quantile_label.value = f"Blue quantile: {val:.2f}" if val is not None else "Blue quantile: --"
+            try:
+                if pre_quantile_label.page:
+                    pre_quantile_label.update()
+            except Exception:
+                pass
+
+        _update_quant_label(pre_quantile.value)
+
+        def _on_quantile_change(e) -> None:
+            try:
+                v = float(e.control.value)
+            except Exception:
+                v = pre_quantile.value or 0.2
+            _update_quant_label(v)
+
+        pre_quantile.on_change = _on_quantile_change
 
         # Status
         step_text = ft.Text("Ready", size=12, color=pal["muted"]) 
         progress = ft.ProgressBar(value=0.0, color=pal["primary"], bgcolor=pal["border"]) 
         result_text = ft.Text("", selectable=True, color=pal["muted"]) 
+
+        def _field_float(field: ft.TextField, default: float | None = None) -> float | None:
+            txt = (field.value or "").strip()
+            if not txt:
+                return default
+            return float(txt)
 
         def on_msg(msg: dict):
             try:
@@ -327,31 +332,21 @@ def run_flet_app() -> None:
             def worker():
                 try:
                     url = None
+                    min_w = _field_float(pre_wmin, 0.0) or 0.0
+                    max_w = _field_float(pre_wmax)
+                    min_l = _field_float(pre_lmin, 0.0) or 0.0
+                    max_l = _field_float(pre_lmax)
+                    small_buf = _field_float(pre_small_buffer, 0.3)
+                    quant = float(pre_quantile.value or 0.15)
                     aoi_temp, n_polys = detect_cultivation_plots(
                         raster_path=in_raster.value.strip(),
                         output_root=output_dir.value.strip(),
-                        downscale_max=int(pre_downscale.value or 1200),
-                        disable_filters=bool(pre_disable_filters.value),
-                        min_region_px=int(pre_min_region.value or 300),
-                        mask_mode=(pre_mask_mode.value or "and"),
-                        orient_tolerance_deg=float(pre_orient_tol.value or 12),
-                        ar_min=float(pre_ar_min.value or 1.2),
-                        ar_max=float(pre_ar_max.value or 12.0),
-                        blue_band_index=int(pre_blue_band.value or 1),
-                        clahe_enable=bool(pre_clahe_enable.value),
-                        clahe_clip=float(pre_clahe_clip.value or 2.0),
-                        clahe_tile=int(pre_clahe_tile.value or 8),
-                        texture_window=int(pre_tex_win.value or 10),
-                        thr_relax_blue=float(pre_thr_b_relax.value or 0.95),
-                        thr_relax_tex=float(pre_thr_t_relax.value or 0.90),
-                        morph_close_radius=int(pre_morph_radius.value or 1),
-                        hole_area_frac=float(pre_hole_frac.value or 0.4),
-                        approx_epsilon_frac=float(pre_approx_eps.value or 0.02),
-                        fill_ratio_min=float(pre_fill_min.value or 0.35),
-                        nms_iou_thresh=float(pre_nms_iou.value or 0.25),
-                        buffer_shrink=float(pre_buf_shrink.value or 0.05),
-                        width_m_range=((float(pre_wmin.value), float(pre_wmax.value)) if float(pre_wmax.value or 0) >= float(pre_wmin.value or 0) and float(pre_wmax.value or 0) > 0 else None),
-                        length_m_range=((float(pre_lmin.value), float(pre_lmax.value)) if float(pre_lmax.value or 0) >= float(pre_lmin.value or 0) and float(pre_lmax.value or 0) > 0 else None),
+                        min_width_m=min_w,
+                        max_width_m=max_w,
+                        min_length_m=min_l,
+                        max_length_m=max_l,
+                        small_polygon_buffer_m=small_buf if small_buf is not None else 0.0,
+                        blue_quantile=quant,
                         progress=lambda d,t,n: page.pubsub.send_all({"kind":"progress","text": f"Preselection: {n or ''}", "ratio": (0 if t==0 else d/max(1,t))}),
                     )
                     aoi_final = save_preselection_to_output(aoi_temp, output_dir.value.strip())
@@ -369,31 +364,21 @@ def run_flet_app() -> None:
             def worker():
                 try:
                     # Preselection first
+                    min_w = _field_float(pre_wmin, 0.0) or 0.0
+                    max_w = _field_float(pre_wmax)
+                    min_l = _field_float(pre_lmin, 0.0) or 0.0
+                    max_l = _field_float(pre_lmax)
+                    small_buf = _field_float(pre_small_buffer, 0.3)
+                    quant = float(pre_quantile.value or 0.15)
                     aoi_temp, _ = detect_cultivation_plots(
                         raster_path=in_raster.value.strip(),
                         output_root=output_dir.value.strip(),
-                        downscale_max=int(pre_downscale.value or 1200),
-                        disable_filters=bool(pre_disable_filters.value),
-                        min_region_px=int(pre_min_region.value or 300),
-                        mask_mode=(pre_mask_mode.value or "and"),
-                        orient_tolerance_deg=float(pre_orient_tol.value or 12),
-                        ar_min=float(pre_ar_min.value or 1.2),
-                        ar_max=float(pre_ar_max.value or 12.0),
-                        blue_band_index=int(pre_blue_band.value or 1),
-                        clahe_enable=bool(pre_clahe_enable.value),
-                        clahe_clip=float(pre_clahe_clip.value or 2.0),
-                        clahe_tile=int(pre_clahe_tile.value or 8),
-                        texture_window=int(pre_tex_win.value or 10),
-                        thr_relax_blue=float(pre_thr_b_relax.value or 0.95),
-                        thr_relax_tex=float(pre_thr_t_relax.value or 0.90),
-                        morph_close_radius=int(pre_morph_radius.value or 1),
-                        hole_area_frac=float(pre_hole_frac.value or 0.4),
-                        approx_epsilon_frac=float(pre_approx_eps.value or 0.02),
-                        fill_ratio_min=float(pre_fill_min.value or 0.35),
-                        nms_iou_thresh=float(pre_nms_iou.value or 0.25),
-                        buffer_shrink=float(pre_buf_shrink.value or 0.05),
-                        width_m_range=((float(pre_wmin.value), float(pre_wmax.value)) if float(pre_wmax.value or 0) >= float(pre_wmin.value or 0) and float(pre_wmax.value or 0) > 0 else None),
-                        length_m_range=((float(pre_lmin.value), float(pre_lmax.value)) if float(pre_lmax.value or 0) >= float(pre_lmin.value or 0) and float(pre_lmax.value or 0) > 0 else None),
+                        min_width_m=min_w,
+                        max_width_m=max_w,
+                        min_length_m=min_l,
+                        max_length_m=max_l,
+                        small_polygon_buffer_m=small_buf if small_buf is not None else 0.0,
+                        blue_quantile=quant,
                         progress=lambda d,t,n: page.pubsub.send_all({"kind":"progress","text": "Preselection", "ratio": (0 if t==0 else d/max(1,t))}),
                     )
                     aoi_final = save_preselection_to_output(aoi_temp, output_dir.value.strip())
@@ -449,45 +434,41 @@ def run_flet_app() -> None:
         # Preselection (emerald)
         pre = section(
             "Preselection",
-            # Collapsible subsections
-            ft.ExpansionTile(
-                title=ft.Row([ft.Icon(ft.icons.FILTER_ALT), ft.Text("Masks & gating", weight=ft.FontWeight.W_600)], spacing=8),
-                initially_expanded=False,
-                controls=[
-                    ft.Row([pre_disable_filters, labeled_row("Mask mode", pre_mask_mode, icon=ft.icons.FILTER_ALT, tip="Combine masks: AND conservative, OR permissive."), labeled_row("Min region (px)", pre_min_region, icon=ft.icons.GRID_ON, tip="Minimum connected-component size at downscaled resolution.")], wrap=True),
-                    ft.Row([labeled_row("AR min", pre_ar_min, icon=ft.icons.STRAIGHTEN, tip="Minimum aspect ratio (long/short)."), labeled_row("AR max", pre_ar_max, icon=ft.icons.STRAIGHTEN, tip="Maximum aspect ratio (long/short)."), labeled_row("Orient tol (deg)", pre_orient_tol, icon=ft.icons.EXPLORE, tip="Tolerance around dominant plot orientation.")], wrap=True),
-                    ft.Row([labeled_row("Width m [min]", pre_wmin, icon=ft.icons.UNFOLD_MORE, tip="Minimum expected plot width (m)."), labeled_row("Width m [max]", pre_wmax, icon=ft.icons.UNFOLD_MORE, tip="Maximum expected plot width (m)."), labeled_row("Length m [min]", pre_lmin, icon=ft.icons.SPACE_BAR, tip="Minimum expected plot length (m)."), labeled_row("Length m [max]", pre_lmax, icon=ft.icons.SPACE_BAR, tip="Maximum expected plot length (m).")], wrap=True),
+            ft.Text("Set the expected plot sizes (meters). Leave max fields empty if unknown.", color=pal["muted"]),
+            ft.Row(
+                [
+                    labeled_row("Min width (m)", pre_wmin, icon=ft.icons.UNFOLD_MORE, tip="Plots narrower than this are ignored when estimating orientation or merging."),
+                    labeled_row("Max width (m)", pre_wmax, icon=ft.icons.UNFOLD_MORE, tip="Optional ceiling for plot width."),
                 ],
+                wrap=True,
             ),
-            ft.ExpansionTile(
-                title=ft.Row([ft.Icon(ft.icons.IMAGE), ft.Text("Image transforms", weight=ft.FontWeight.W_600)], spacing=8),
-                initially_expanded=False,
-                controls=[
-                    ft.Row([labeled_row("Downscale max (px)", pre_downscale, icon=ft.icons.PHOTO_SIZE_SELECT_LARGE, tip="Max width/height of working raster for detection."), labeled_row("Blue band index", pre_blue_band, icon=ft.icons.PALETTE, tip="1-based band index used as Blue." )], wrap=True),
-                    ft.Row([pre_clahe_enable, labeled_row("CLAHE clip", pre_clahe_clip, icon=ft.icons.TONALITY, tip="CLAHE clip limit."), labeled_row("CLAHE tile", pre_clahe_tile, icon=ft.icons.GRID_ON, tip="CLAHE tile size (pixels).")], wrap=True),
-                    ft.Row([labeled_row("Texture window", pre_tex_win, icon=ft.icons.TEXTURE, tip="Window size for local standard-deviation texture.")], wrap=True),
+            ft.Row(
+                [
+                    labeled_row("Min length (m)", pre_lmin, icon=ft.icons.SPACE_BAR, tip="Minimum expected plot length."),
+                    labeled_row("Max length (m)", pre_lmax, icon=ft.icons.SPACE_BAR, tip="Optional ceiling for plot length."),
                 ],
+                wrap=True,
             ),
-            ft.ExpansionTile(
-                title=ft.Row([ft.Icon(ft.icons.TUNE), ft.Text("Thresholds", weight=ft.FontWeight.W_600)], spacing=8),
-                initially_expanded=False,
-                controls=[
-                    ft.Row([labeled_row("Blue thr relax", pre_thr_b_relax, icon=ft.icons.TUNE, tip="Multiplier < 1.0 lowers Otsu threshold for blue mask."), labeled_row("Tex thr relax", pre_thr_t_relax, icon=ft.icons.TUNE, tip="Multiplier < 1.0 lowers Otsu threshold for texture mask.")], wrap=True),
+            ft.Row(
+                [
+                    labeled_row(
+                        "Small-plot buffer (m)",
+                        pre_small_buffer,
+                        icon=ft.icons.CROP_FREE,
+                        tip="Undersized polygons are buffered by this amount before merging so they can fuse with neighbours.",
+                    ),
                 ],
+                wrap=True,
             ),
-            ft.ExpansionTile(
-                title=ft.Row([ft.Icon(ft.icons.CATEGORY), ft.Text("Morphology & detection", weight=ft.FontWeight.W_600)], spacing=8),
-                initially_expanded=False,
-                controls=[
-                    ft.Row([labeled_row("Closing radius", pre_morph_radius, icon=ft.icons.CATEGORY, tip="Binary closing radius (pixels)."), labeled_row("Hole area frac", pre_hole_frac, icon=ft.icons.DONUT_LARGE, tip="Fraction of min region to fill holes."), labeled_row("Approx eps frac", pre_approx_eps, icon=ft.icons.STRAIGHTEN, tip="Perimeter fraction used by polygon simplification.")], wrap=True),
-                ],
-            ),
-            ft.ExpansionTile(
-                title=ft.Row([ft.Icon(ft.icons.LAYERS), ft.Text("Post-filtering", weight=ft.FontWeight.W_600)], spacing=8),
-                initially_expanded=False,
-                controls=[
-                    ft.Row([labeled_row("Fill ratio min", pre_fill_min, icon=ft.icons.SPACE_BAR, tip="Contour area / rectangle area must be >= this value."), labeled_row("NMS IoU", pre_nms_iou, icon=ft.icons.LAYERS_CLEAR, tip="Max overlap allowed during non-max suppression."), labeled_row("Shrink buffer (m)", pre_buf_shrink, icon=ft.icons.BORDER_INNER, tip="Inset polygons by this distance (meters).")], wrap=True),
-                ],
+            ft.Container(
+                ft.Column(
+                    [
+                        pre_quantile_label,
+                        pre_quantile,
+                    ],
+                    spacing=4,
+                ),
+                padding=ft.padding.symmetric(horizontal=4),
             ),
             subtitle="Tune AOI detection and run.",
             bgcolor="#EAF7F5",
