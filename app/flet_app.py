@@ -39,7 +39,85 @@ def run_flet_app() -> None:
             "muted":   "#6E7A8A",
         }
 
-    def section(title: str, *children: ft.Control, icon: Optional[str] = None, subtitle: Optional[str] = None, bgcolor: Optional[str] = None) -> ft.Card:
+    if not hasattr(ft, "ExpansionTile"):
+        class _CompatExpansionTile(ft.UserControl):
+            def __init__(
+                self,
+                *,
+                title: ft.Control,
+                controls: Optional[list[ft.Control]] = None,
+                subtitle: Optional[ft.Control] = None,
+                initially_expanded: bool = False,
+            ) -> None:
+                super().__init__()
+                self._title = title
+                self._subtitle = subtitle
+                self._controls = list(controls or [])
+                self._expanded = initially_expanded
+                self._chevron: ft.Icon | None = None
+                self._body: ft.Column | None = None
+
+            def build(self) -> ft.Control:
+                pal = _palette()
+                self._chevron = ft.Icon(
+                    name=ft.icons.KEYBOARD_ARROW_DOWN if self._expanded else ft.icons.KEYBOARD_ARROW_RIGHT,
+                    color=pal["muted"],
+                )
+                header_controls = [self._title]
+                if self._subtitle is not None:
+                    header_controls.append(self._subtitle)
+                header_column = ft.Column(
+                    controls=header_controls,
+                    spacing=2,
+                    expand=True,
+                )
+                header_row = ft.Row(
+                    controls=[
+                        ft.Container(self._chevron, width=28),
+                        header_column,
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=8,
+                    expand=True,
+                )
+                header = ft.Container(
+                    content=header_row,
+                    on_click=self._toggle,
+                )
+                self._body = ft.Column(
+                    controls=list(self._controls),
+                    spacing=8,
+                    visible=self._expanded,
+                )
+                return ft.Column(
+                    controls=[
+                        header,
+                        self._body,
+                    ],
+                    spacing=6,
+                    expand=True,
+                )
+
+            def _toggle(self, _=None) -> None:
+                self._expanded = not self._expanded
+                if self._body is not None:
+                    self._body.visible = self._expanded
+                if self._chevron is not None:
+                    self._chevron.name = (
+                        ft.icons.KEYBOARD_ARROW_DOWN if self._expanded else ft.icons.KEYBOARD_ARROW_RIGHT
+                    )
+                self.update()
+
+        ft.ExpansionTile = _CompatExpansionTile
+
+    def section(
+        title: str,
+        *children: ft.Control,
+        icon: Optional[str] = None,
+        subtitle: Optional[str] = None,
+        bgcolor: Optional[str] = None,
+        expanded: bool = False,
+    ) -> ft.Card:
         pal = _palette()
         tile = ft.ExpansionTile(
             title=ft.Row([
@@ -47,7 +125,7 @@ def run_flet_app() -> None:
                 ft.Text(title, size=16, weight=ft.FontWeight.W_600),
             ], spacing=8),
             subtitle=ft.Text(subtitle or "", size=12, color=pal["muted"]) if subtitle else None,
-            initially_expanded=True,
+            initially_expanded=expanded,
             controls=list(children),
         )
         return ft.Card(
@@ -239,9 +317,8 @@ def run_flet_app() -> None:
         dp_output = ft.FilePicker(on_result=on_pick_output)
         fp_otb = ft.FilePicker(on_result=on_pick_otb)
         # Classification pickers (defined later)
-        fp_model = ft.FilePicker()
         fp_train = ft.FilePicker()
-        page.overlay.extend([fp_raster, dp_output, fp_otb, fp_model, fp_train])
+        page.overlay.extend([fp_raster, dp_output, fp_otb, fp_train])
 
         # Actions
         def run_preselection_only():
@@ -329,9 +406,32 @@ def run_flet_app() -> None:
                         in_raster=in_raster.value.strip(),
                         output_root=output_dir.value.strip(),
                         otb_bin=otb_bin.value.strip(),
+                        aoi_path=aoi_final,
                         progress=lambda d,t,n: page.pubsub.send_all({"kind":"progress","text": "Segmentation", "ratio": (0 if t==0 else d/max(1,t))}),
                     )
-                    page.pubsub.send_all({"kind":"result","text": f"Segmentation done. Outputs in: {seg_res.out_dir}"})
+                    final_seg_path = seg_res.out_shp
+                    aoi_note = ""
+                    if aoi_final and os.path.exists(aoi_final):
+                        try:
+                            seg_gdf = gpd.read_file(seg_res.out_shp)
+                            aoi_gdf = gpd.read_file(aoi_final)
+                            if len(seg_gdf) > 0 and len(aoi_gdf) > 0:
+                                if seg_gdf.crs and aoi_gdf.crs and str(seg_gdf.crs) != str(aoi_gdf.crs):
+                                    aoi_gdf = aoi_gdf.to_crs(seg_gdf.crs)
+                                clipped = gpd.sjoin(seg_gdf, aoi_gdf, predicate="intersects", how="inner")
+                                if "index_right" in clipped.columns:
+                                    clipped = clipped.drop(columns=["index_right"])
+                                clipped = clipped.loc[~clipped.geometry.is_empty].reset_index(drop=True)
+                                if len(clipped) > 0:
+                                    filtered = seg_res.out_dir / f"{seg_res.out_shp.stem}_AOI.shp"
+                                    clipped.to_file(filtered)
+                                    final_seg_path = filtered
+                                    aoi_note = f"\nAOI-filtered segments: {len(clipped)}"
+                                else:
+                                    aoi_note = "\nAOI filter returned zero segments."
+                        except Exception as aoi_err:
+                            aoi_note = f"\nAOI filter failed: {aoi_err}"
+                    page.pubsub.send_all({"kind":"result","text": f"Segmentation done. Outputs in: {seg_res.out_dir}\nFinal segments: {final_seg_path}{aoi_note}"})
                 except Exception as ex:  # noqa: BLE001
                     page.pubsub.send_all({"kind":"result","text": f"Workflow failed: {ex}"})
             threading.Thread(target=worker, daemon=True).start()
@@ -344,6 +444,7 @@ def run_flet_app() -> None:
             labeled_row("OTB path", ft.Row([otb_bin, ft.OutlinedButton("Browse", icon=ft.icons.BUILD_OUTLINED, on_click=lambda _: fp_otb.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.BUILD_OUTLINED, tip="Path to OTB LargeScaleMeanShift executable."),
             subtitle="Set inputs and outputs.",
             bgcolor=pal["alt"],
+            expanded=True,
         )
         # Preselection (emerald)
         pre = section(
@@ -351,7 +452,7 @@ def run_flet_app() -> None:
             # Collapsible subsections
             ft.ExpansionTile(
                 title=ft.Row([ft.Icon(ft.icons.FILTER_ALT), ft.Text("Masks & gating", weight=ft.FontWeight.W_600)], spacing=8),
-                initially_expanded=True,
+                initially_expanded=False,
                 controls=[
                     ft.Row([pre_disable_filters, labeled_row("Mask mode", pre_mask_mode, icon=ft.icons.FILTER_ALT, tip="Combine masks: AND conservative, OR permissive."), labeled_row("Min region (px)", pre_min_region, icon=ft.icons.GRID_ON, tip="Minimum connected-component size at downscaled resolution.")], wrap=True),
                     ft.Row([labeled_row("AR min", pre_ar_min, icon=ft.icons.STRAIGHTEN, tip="Minimum aspect ratio (long/short)."), labeled_row("AR max", pre_ar_max, icon=ft.icons.STRAIGHTEN, tip="Maximum aspect ratio (long/short)."), labeled_row("Orient tol (deg)", pre_orient_tol, icon=ft.icons.EXPLORE, tip="Tolerance around dominant plot orientation.")], wrap=True),
@@ -407,12 +508,59 @@ def run_flet_app() -> None:
         )
 
         # Classification (amber)
-        clf_mode = ft.RadioGroup(value="existing", content=ft.Row([ft.Radio(value="existing", label="Use existing model"), ft.Radio(value="train", label="Train new model")]))
-        model_path = ft.TextField(value="", expand=True, hint_text="Path to .joblib model")
+        clf_mode = ft.RadioGroup(
+            value="existing",
+            content=ft.Row(
+                [
+                    ft.Radio(value="existing", label="Use existing model"),
+                    ft.Radio(value="train", label="Train new model"),
+                ]
+            ),
+        )
+        model_path = ft.Dropdown(
+            options=[],
+            expand=True,
+            hint_text="Select a model from the 'Model' directory",
+        )
+        model_hint = ft.Text("", size=12, color=pal["muted"])
+        max_pixels_per_polygon = ft.TextField(value="200", width=120, hint_text="Pixels/polygon", text_align=ft.TextAlign.RIGHT)
         train_polys = ft.TextField(value="", expand=True, hint_text="Path to training polygons (.shp/.gpkg/.geojson)")
         class_column = ft.Dropdown(options=[], width=240)
         max_pixels_per_class = ft.TextField(value="0", width=100, hint_text="0 = no cap")
-        max_pixels_per_polygon = ft.TextField(value="200", width=100)
+
+        def on_pick_train(e: ft.FilePickerResultEvent):
+            try:
+                if e.files:
+                    train_polys.value = e.files[0].path
+                    train_polys.update()
+            except Exception:
+                pass
+
+        fp_train.on_result = on_pick_train
+
+        def refresh_model_list(_=None):
+            root = Path("Model")
+            options: list[ft.dropdown.Option] = []
+            note = ""
+            try:
+                files = sorted(p for p in root.glob("*.joblib")) if root.exists() else []
+                if files:
+                    options = [ft.dropdown.Option(fp.name, key=str(fp.resolve())) for fp in files]
+                    current_keys = {opt.key or opt.text for opt in options}
+                    if model_path.value not in current_keys:
+                        first = options[0]
+                        model_path.value = first.key or first.text
+                    note = f"Found {len(files)} model(s) in '{root}'."
+                else:
+                    model_path.value = None
+                    note = f"No .joblib models found in '{root}'."
+            except Exception as exc:  # noqa: BLE001
+                model_path.value = None
+                note = f"Failed to read '{root}': {exc}"
+            model_path.options = options
+            model_path.update()
+            model_hint.value = note
+            model_hint.update()
 
         def load_fields(_):
             try:
@@ -426,14 +574,84 @@ def run_flet_app() -> None:
             except Exception:
                 pass
 
+        existing_controls = ft.Column(
+            [
+                labeled_row(
+                    "Model (.joblib)",
+                    ft.Row(
+                        [
+                            model_path,
+                            ft.IconButton(icon=ft.icons.REFRESH, tooltip="Rescan Model directory", on_click=refresh_model_list),
+                        ],
+                        spacing=8,
+                        expand=True,
+                    ),
+                    icon=ft.icons.SAVE_ALT,
+                    tip="Select a trained classifier stored under the Model directory.",
+                ),
+                model_hint,
+                labeled_row(
+                    "Pixels/polygon (prediction)",
+                    max_pixels_per_polygon,
+                    icon=ft.icons.SPEED,
+                    tip="Number of pixels sampled in each polygon when applying the model.",
+                ),
+            ],
+            spacing=8,
+            visible=True,
+        )
+
+        train_controls = ft.Column(
+            [
+                labeled_row(
+                    "Training polygons",
+                    ft.Row(
+                        [
+                            train_polys,
+                            ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_train.pick_files(allow_multiple=False)),
+                            ft.OutlinedButton("Load Fields", icon=ft.icons.TABLE_VIEW, on_click=load_fields),
+                        ],
+                        spacing=6,
+                        expand=True,
+                    ),
+                    icon=ft.icons.MAP_OUTLINED,
+                    tip="Vector dataset of labeled training polygons.",
+                ),
+                ft.Row(
+                    [
+                        labeled_row(
+                            "Class column",
+                            class_column,
+                            icon=ft.icons.LIST_ALT,
+                            tip="Column containing class labels.",
+                        ),
+                        labeled_row(
+                            "Max pixels/class",
+                            max_pixels_per_class,
+                            icon=ft.icons.SPEED,
+                            tip="Maximum sampled pixels per class (0 = no cap).",
+                        ),
+                    ],
+                    wrap=True,
+                ),
+            ],
+            spacing=10,
+            visible=False,
+        )
+
+        def on_clf_mode_change(_=None):
+            use_existing = (clf_mode.value or "existing") == "existing"
+            existing_controls.visible = use_existing
+            train_controls.visible = not use_existing
+            page.update()
+
+        clf_mode.on_change = on_clf_mode_change
         clf = section(
             "Classification",
             ft.Row([ft.Text("Mode", width=210, tooltip="Use an existing model or train a new one."), clf_mode], wrap=False),
             ft.Divider(height=8),
-            labeled_row("Model (.joblib)", ft.Row([model_path, ft.OutlinedButton("Browse", icon=ft.icons.UPLOAD_FILE, on_click=lambda _: fp_model.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.SAVE_ALT, tip="Path to saved classifier model (.joblib)."),
-            labeled_row("Training polygons", ft.Row([train_polys, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_train.pick_files(allow_multiple=False)), ft.OutlinedButton("Load Fields", icon=ft.icons.TABLE_VIEW, on_click=load_fields)], expand=True), icon=ft.icons.MAP_OUTLINED, tip="Vector dataset of labeled training polygons."),
-            ft.Row([labeled_row("Class column", class_column, icon=ft.icons.LIST_ALT, tip="Column name containing class labels."), labeled_row("Max pixels/class", max_pixels_per_class, icon=ft.icons.SPEED, tip="Maximum sampled pixels per class (0 = no cap).")], wrap=True),
-            ft.Row([labeled_row("Max pixels/polygon", max_pixels_per_polygon, icon=ft.icons.SPEED, tip="Maximum sampled pixels per polygon.")], wrap=True),
+            existing_controls,
+            train_controls,
             subtitle="Use an existing model or train a new one, then apply.",
             bgcolor="#FFF4EA",
         )
@@ -454,6 +672,9 @@ def run_flet_app() -> None:
                 result_text,
             ], expand=True, spacing=12)
         )
+
+        refresh_model_list()
+        on_clf_mode_change()
 
     import flet as ft  # type: ignore
     ft.app(target=main)

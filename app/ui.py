@@ -417,6 +417,7 @@ class ImageSelectorApp(ttk.Frame):
                     tile_size_m=int(session.seg_tile_size_m),
                     spatialr=int(session.seg_spatialr),
                     minsize=int(session.seg_minsize),
+                    aoi_path=self._last_aoi_path,
                     progress=make_cb("Segmentation"),
                 )
                 # Filter segments to AOI

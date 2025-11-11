@@ -77,6 +77,7 @@ def run_segmentation(
     tile_size_m: int = 40,
     spatialr: int = 5,
     minsize: int = 5,
+    aoi_path: str | os.PathLike | None = None,
     progress: Optional[ProgressCallback] = None,
 ) -> SegmentationResult:
     """
@@ -84,6 +85,7 @@ def run_segmentation(
 
     - Tiles the raster by physical size (m) converted to pixels via geotransform
     - Computes ranger per tile: sd(band1)/2 (ignoring 0 and 65535)
+    - Optionally skips tiles that do not intersect `aoi_path` polygons
     - Calls OTB LargeScaleMeanShift per tile to produce BOTH raster and vector outputs
       (runs raster mode, then vector mode)
     - Writes per-tile raster and shapefiles to Temp (temporary workspace)
@@ -96,11 +98,14 @@ def run_segmentation(
     in_raster = str(in_raster)
     output_root = str(output_root)
     otb_bin = str(otb_bin)
+    aoi_path_str = str(aoi_path) if aoi_path else None
 
     if not os.path.exists(in_raster):
         raise FileNotFoundError(f"Input raster not found: {in_raster}")
     if not os.path.exists(otb_bin):
         raise FileNotFoundError("OTB LargeScaleMeanShift not found; set the proper path")
+    if aoi_path_str and not os.path.exists(aoi_path_str):
+        raise FileNotFoundError(f"AOI polygons not found: {aoi_path_str}")
 
     base_out = Path(output_root)
     out_dir, temp_dir, out_shp, _ts = _ensure_dirs(base_out)
@@ -114,9 +119,32 @@ def run_segmentation(
         cols = math.ceil(W / tile_px)
         rows = math.ceil(H / tile_px)
         total = cols * rows
+        aoi_mask = None
+        tile_box = None
+        if aoi_path_str:
+            try:
+                import geopandas as gpd
+                from shapely.geometry import box as shapely_box
+                from shapely.ops import unary_union
+                from shapely.prepared import prep
+            except Exception as e:  # pragma: no cover - optional dependency guard
+                raise RuntimeError("AOI filtering requires GeoPandas/Shapely.") from e
+            aoi_gdf = gpd.read_file(aoi_path_str)
+            if len(aoi_gdf) > 0:
+                if src.crs and aoi_gdf.crs and str(src.crs) != str(aoi_gdf.crs):
+                    aoi_gdf = aoi_gdf.to_crs(src.crs)
+                geoms = [
+                    geom.buffer(0)
+                    for geom in aoi_gdf.geometry
+                    if geom is not None and not geom.is_empty
+                ]
+                if geoms:
+                    union_geom = unary_union(geoms)
+                    aoi_mask = prep(union_geom)
+                    tile_box = shapely_box
 
         if progress:
-            progress(0, total, "Initializing tiles…")
+            progress(0, total, "Initializing tiles...")
 
         for r in range(rows):
             for c in range(cols):
@@ -132,6 +160,15 @@ def run_segmentation(
 
                 window = rasterio.windows.Window(x0, y0, w, h)
                 transform = src.window_transform(window)
+
+                if aoi_mask is not None and tile_box is not None:
+                    bounds = rasterio.windows.bounds(window, src.transform)
+                    tile_geom = tile_box(*bounds)
+                    if tile_geom.is_empty or not aoi_mask.intersects(tile_geom):
+                        done += 1
+                        if progress:
+                            progress(done, total, "Skipping tile outside AOI.")
+                        continue
 
                 ranger = _ranger_from_band1(src, window)
 
@@ -172,7 +209,7 @@ def run_segmentation(
                     "-mode.vector.out", vec_out_arg,
                 ]
 
-                note = f"Tile {done+1}/{total} • ranger={ranger:.3f}"
+                note = f"Tile {done+1}/{total} | ranger={ranger:.3f}"
                 if progress:
                     progress(done, total, note)
 
