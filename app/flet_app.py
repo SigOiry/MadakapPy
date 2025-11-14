@@ -217,6 +217,7 @@ def run_flet_app() -> None:
         in_raster = ft.TextField(value=default_in, expand=True)
         output_dir = ft.TextField(value=default_out, expand=True)
         otb_bin = ft.TextField(value=default_otb, expand=True)
+        train_image = ft.TextField(value=default_in, expand=True, hint_text="Training image (GeoTIFF)")
 
         # Preselection controls (size-only workflow)
         pre_wmin = ft.TextField(value="5", width=120, text_align=ft.TextAlign.RIGHT)
@@ -297,12 +298,20 @@ def run_flet_app() -> None:
                 pass
 
         page.pubsub.subscribe(on_msg)
+        tabs_ref: ft.Ref[ft.Tabs] = ft.Ref()
 
         # Pickers
         def on_pick_raster(e: ft.FilePickerResultEvent):
             try:
                 if e.files:
-                    in_raster.value = e.files[0].path; in_raster.update()
+                    selected = e.files[0].path
+                    prev_in = in_raster.value
+                    in_raster.value = selected
+                    in_raster.update()
+                    train_val = (train_image.value or "").strip()
+                    if not train_val or (prev_in and train_val == (prev_in or "").strip()):
+                        train_image.value = selected
+                        train_image.update()
             except Exception:
                 pass
         def on_pick_output(e: ft.FilePickerResultEvent):
@@ -318,12 +327,20 @@ def run_flet_app() -> None:
                     otb_bin.value = e.files[0].path; otb_bin.update()
             except Exception:
                 pass
+        def on_pick_train_image(e: ft.FilePickerResultEvent):
+            try:
+                if e.files:
+                    train_image.value = e.files[0].path
+                    train_image.update()
+            except Exception:
+                pass
         fp_raster = ft.FilePicker(on_result=on_pick_raster)
         dp_output = ft.FilePicker(on_result=on_pick_output)
         fp_otb = ft.FilePicker(on_result=on_pick_otb)
+        fp_train_image = ft.FilePicker(on_result=on_pick_train_image)
         # Classification pickers (defined later)
         fp_train = ft.FilePicker()
-        page.overlay.extend([fp_raster, dp_output, fp_otb, fp_train])
+        page.overlay.extend([fp_raster, dp_output, fp_otb, fp_train, fp_train_image])
 
         # Actions
         def run_preselection_only():
@@ -361,6 +378,10 @@ def run_flet_app() -> None:
         def run_workflow(_):
             if not in_raster.value.strip() or not output_dir.value.strip() or not os.path.exists(otb_bin.value.strip()):
                 step_text.value = "Set input raster, output directory and a valid OTB path"; page.update(); return
+            if not (model_path.value or "").strip():
+                step_text.value = "Select a model before running the workflow"
+                page.update()
+                return
             def worker():
                 try:
                     # Preselection first
@@ -489,15 +510,6 @@ def run_flet_app() -> None:
         )
 
         # Classification (amber)
-        clf_mode = ft.RadioGroup(
-            value="existing",
-            content=ft.Row(
-                [
-                    ft.Radio(value="existing", label="Use existing model"),
-                    ft.Radio(value="train", label="Train new model"),
-                ]
-            ),
-        )
         model_path = ft.Dropdown(
             options=[],
             expand=True,
@@ -505,15 +517,23 @@ def run_flet_app() -> None:
         )
         model_hint = ft.Text("", size=12, color=pal["muted"])
         max_pixels_per_polygon = ft.TextField(value="200", width=120, hint_text="Pixels/polygon", text_align=ft.TextAlign.RIGHT)
-        train_polys = ft.TextField(value="", expand=True, hint_text="Path to training polygons (.shp/.gpkg/.geojson)")
-        class_column = ft.Dropdown(options=[], width=240)
-        max_pixels_per_class = ft.TextField(value="0", width=100, hint_text="0 = no cap")
+        train_polys = ft.TextField(value="", expand=True, hint_text="Training polygons (.shp/.gpkg/.geojson)")
+        class_column = ft.Dropdown(options=[], expand=True)
+        max_pixels_per_class = ft.TextField(value="0", width=120, hint_text="0 = no cap")
+        train_info = ft.Text("", size=12, color=pal["muted"])
+
+        def switch_to_training_tab(_=None):
+            tabs = tabs_ref.current
+            if tabs is not None:
+                tabs.selected_index = 1
+                tabs.update()
 
         def on_pick_train(e: ft.FilePickerResultEvent):
             try:
                 if e.files:
                     train_polys.value = e.files[0].path
                     train_polys.update()
+                    load_fields(None)
             except Exception:
                 pass
 
@@ -545,97 +565,186 @@ def run_flet_app() -> None:
 
         def load_fields(_):
             try:
-                if train_polys.value.strip() and os.path.exists(train_polys.value.strip()):
-                    gdf = gpd.read_file(train_polys.value.strip())
+                path = (train_polys.value or "").strip()
+                if path and os.path.exists(path):
+                    gdf = gpd.read_file(path)
                     cols = [c for c in gdf.columns if c.lower() != "geometry"]
                     class_column.options = [ft.dropdown.Option(c) for c in cols]
                     if cols:
                         class_column.value = cols[0]
+                    train_info.value = f"Polygons: {len(gdf)} | Fields: {len(cols)}"
                     page.update()
             except Exception:
-                pass
+                train_info.value = "Could not read fields."
+                page.update()
 
-        existing_controls = ft.Column(
-            [
-                labeled_row(
-                    "Model (.joblib)",
-                    ft.Row(
-                        [
-                            model_path,
-                            ft.IconButton(icon=ft.icons.REFRESH, tooltip="Rescan Model directory", on_click=refresh_model_list),
-                        ],
-                        spacing=8,
-                        expand=True,
-                    ),
-                    icon=ft.icons.SAVE_ALT,
-                    tip="Select a trained classifier stored under the Model directory.",
-                ),
-                model_hint,
-                labeled_row(
-                    "Pixels/polygon (prediction)",
-                    max_pixels_per_polygon,
-                    icon=ft.icons.SPEED,
-                    tip="Number of pixels sampled in each polygon when applying the model.",
-                ),
-            ],
-            spacing=8,
-            visible=True,
-        )
-
-        train_controls = ft.Column(
-            [
-                labeled_row(
-                    "Training polygons",
-                    ft.Row(
-                        [
-                            train_polys,
-                            ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_train.pick_files(allow_multiple=False)),
-                            ft.OutlinedButton("Load Fields", icon=ft.icons.TABLE_VIEW, on_click=load_fields),
-                        ],
-                        spacing=6,
-                        expand=True,
-                    ),
-                    icon=ft.icons.MAP_OUTLINED,
-                    tip="Vector dataset of labeled training polygons.",
-                ),
+        clf = section(
+            "Model Selection",
+            labeled_row(
+                "Model (.joblib)",
                 ft.Row(
                     [
-                        labeled_row(
-                            "Class column",
-                            class_column,
-                            icon=ft.icons.LIST_ALT,
-                            tip="Column containing class labels.",
-                        ),
-                        labeled_row(
-                            "Max pixels/class",
-                            max_pixels_per_class,
-                            icon=ft.icons.SPEED,
-                            tip="Maximum sampled pixels per class (0 = no cap).",
-                        ),
+                        model_path,
+                        ft.IconButton(icon=ft.icons.REFRESH, tooltip="Rescan Model directory", on_click=refresh_model_list),
                     ],
-                    wrap=True,
+                    spacing=8,
+                    expand=True,
                 ),
-            ],
-            spacing=10,
-            visible=False,
-        )
-
-        def on_clf_mode_change(_=None):
-            use_existing = (clf_mode.value or "existing") == "existing"
-            existing_controls.visible = use_existing
-            train_controls.visible = not use_existing
-            page.update()
-
-        clf_mode.on_change = on_clf_mode_change
-        clf = section(
-            "Classification",
-            ft.Row([ft.Text("Mode", width=210, tooltip="Use an existing model or train a new one."), clf_mode], wrap=False),
-            ft.Divider(height=8),
-            existing_controls,
-            train_controls,
-            subtitle="Use an existing model or train a new one, then apply.",
+                icon=ft.icons.SAVE_ALT,
+                tip="Select a trained classifier stored under the Model directory.",
+            ),
+            model_hint,
+            labeled_row(
+                "Pixels/polygon (prediction)",
+                max_pixels_per_polygon,
+                icon=ft.icons.SPEED,
+                tip="Number of pixels sampled in each polygon when applying the model.",
+            ),
+            ft.TextButton("Need to train a model? Open the Train Model tab →", on_click=switch_to_training_tab),
+            subtitle="Pick an existing Random Forest model to classify new imagery.",
             bgcolor="#FFF4EA",
         )
+
+        def on_train_model(_):
+            switch_to_training_tab()
+            img = (train_image.value or "").strip() or (in_raster.value or "").strip()
+            polys = (train_polys.value or "").strip()
+            cls_col = (class_column.value or "").strip()
+            out_root = (output_dir.value or "").strip()
+            if not img:
+                step_text.value = "Select a training image"
+                page.update()
+                return
+            if not os.path.exists(img):
+                step_text.value = "Training image path is invalid"
+                page.update()
+                return
+            if not polys:
+                step_text.value = "Select training polygons"
+                page.update()
+                return
+            if not os.path.exists(polys):
+                step_text.value = "Training polygons path is invalid"
+                page.update()
+                return
+            if not cls_col:
+                step_text.value = "Pick the class column"
+                page.update()
+                return
+            if not out_root:
+                step_text.value = "Set an output directory first"
+                page.update()
+                return
+            step_text.value = "Training model…"
+            page.update()
+
+            def progress_cb(done: int, total: int, note: str = "") -> None:
+                label = "Training"
+                if note:
+                    label = f"{label} – {note}"
+                ratio = (done / max(1, total)) if total else 0.0
+                page.pubsub.send_all({"kind": "progress", "text": label, "ratio": ratio})
+
+            def worker():
+                try:
+                    cap = 0
+                    try:
+                        cap = int(max_pixels_per_class.value or "0")
+                    except Exception:
+                        cap = 0
+                    res = train_model_from_training_polys(
+                        img,
+                        polys,
+                        cls_col,
+                        out_root,
+                        progress=progress_cb,
+                        max_pixels_per_class=(cap if cap > 0 else None),
+                    )
+                    page.pubsub.send_all({"kind": "result", "text": f"Training complete. Model saved to {res.model_path}"})
+
+                    def finalize():
+                        refresh_model_list()
+                        model_path.value = str(res.model_path)
+                        model_path.update()
+                        step_text.value = "Training complete"
+                        page.update()
+
+                    page.call_from_thread(finalize)
+                except Exception as exc:  # noqa: BLE001
+                    page.pubsub.send_all({"kind": "result", "text": f"Training failed: {exc}"})
+
+                    def fail():
+                        step_text.value = "Training failed"
+                        page.update()
+
+                    page.call_from_thread(fail)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        training_section = section(
+            "Training Inputs",
+            labeled_row(
+                "Training image",
+                ft.Row(
+                    [
+                        train_image,
+                        ft.OutlinedButton(
+                            "Browse",
+                            icon=ft.icons.IMAGE_OUTLINED,
+                            on_click=lambda _: fp_train_image.pick_files(allow_multiple=False),
+                        ),
+                    ],
+                    spacing=6,
+                    expand=True,
+                ),
+                icon=ft.icons.IMAGE_OUTLINED,
+                tip="Raster used to sample per-pixel spectra for training.",
+            ),
+            labeled_row(
+                "Training polygons",
+                ft.Row(
+                    [
+                        train_polys,
+                        ft.OutlinedButton(
+                            "Browse",
+                            icon=ft.icons.FOLDER_OPEN,
+                            on_click=lambda _: fp_train.pick_files(allow_multiple=False),
+                        ),
+                        ft.OutlinedButton("Load Fields", icon=ft.icons.TABLE_VIEW, on_click=load_fields),
+                    ],
+                    spacing=6,
+                    expand=True,
+                ),
+                icon=ft.icons.MAP_OUTLINED,
+                tip="Vector dataset containing class labels.",
+            ),
+            ft.Row(
+                [
+                    labeled_row(
+                        "Class column",
+                        class_column,
+                        icon=ft.icons.LIST_ALT,
+                        tip="Attribute containing the class name.",
+                    ),
+                    labeled_row(
+                        "Max pixels/class",
+                        max_pixels_per_class,
+                        icon=ft.icons.SPEED,
+                        tip="Classes exceeding this limit are randomly down-sampled (0 = no cap).",
+                    ),
+                ],
+                wrap=True,
+            ),
+            ft.Container(train_info, padding=ft.padding.only(left=8)),
+            ft.Text(
+                "If a class contains more pixels than the limit, samples are randomly drawn to match the requested count.",
+                color=pal["muted"],
+                size=12,
+            ),
+            subtitle="Train a new model from labeled polygons.",
+            bgcolor=pal["alt"],
+        )
+        train_btn = ft.ElevatedButton("Train Model", icon=ft.icons.SCIENCE, on_click=on_train_model)
 
         # Footer / actions
         pre_btn = ft.ElevatedButton("Run Preselection", icon=ft.icons.SEARCH, on_click=lambda _: run_preselection_only())
@@ -645,17 +754,63 @@ def run_flet_app() -> None:
         left_col = ft.Column([left, pre], expand=1, spacing=12)
         right_col = ft.Column([seg, clf], expand=1, spacing=12)
 
-        page.add(
-            ft.Column([
+        workflow_body = ft.Column(
+            [
                 ft.Row([left_col, right_col], expand=True, spacing=12),
-                ft.Container(ft.Row([step_text, ft.Container(expand=True), pre_btn, run_btn], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), padding=10),
-                ft.Container(progress, padding=8),
-                result_text,
-            ], expand=True, spacing=12)
+                ft.Row(
+                    [
+                        ft.Container(expand=True),
+                        pre_btn,
+                        run_btn,
+                    ],
+                    alignment=ft.MainAxisAlignment.END,
+                    spacing=12,
+                ),
+            ],
+            expand=True,
+            spacing=12,
+        )
+
+        training_body = ft.Column(
+            [
+                training_section,
+                ft.Row(
+                    [
+                        ft.Container(expand=True),
+                        train_btn,
+                    ],
+                    alignment=ft.MainAxisAlignment.END,
+                    spacing=12,
+                ),
+            ],
+            expand=True,
+            spacing=12,
+        )
+
+        tabs = ft.Tabs(
+            ref=tabs_ref,
+            selected_index=0,
+            expand=1,
+            tabs=[
+                ft.Tab(text="Workflow", content=workflow_body),
+                ft.Tab(text="Train Model", content=training_body),
+            ],
+        )
+
+        page.add(
+            ft.Column(
+                [
+                    tabs,
+                    ft.Container(step_text, padding=10),
+                    ft.Container(progress, padding=8),
+                    result_text,
+                ],
+                expand=True,
+                spacing=8,
+            )
         )
 
         refresh_model_list()
-        on_clf_mode_change()
 
     import flet as ft  # type: ignore
     ft.app(target=main)

@@ -52,8 +52,8 @@ class ImageSelectorApp(ttk.Frame):
         self.var_otb_bin = tk.StringVar(value="OTB/bin/otbcli_LargeScaleMeanShift.bat")
 
         # Classification parameters
-        self.var_model_mode = tk.StringVar(value="existing")  # 'existing' or 'train'
         self.var_model_path = tk.StringVar()
+        self.var_train_raster = tk.StringVar(value=self.var_in_raster.get())
         self.var_train_path = tk.StringVar()
         self.var_class_col = tk.StringVar()
         self.var_max_pixels_per_class = tk.IntVar(value=0)  # 0 = no cap
@@ -76,15 +76,14 @@ class ImageSelectorApp(ttk.Frame):
 
         self.columnconfigure(0, weight=1)
 
-        # Main content (two columns, no scrolling)
         content = ttk.Frame(self, padding=(16, 12), style="Content.TFrame")
         content.grid(row=0, column=0, sticky="nsew")
-        content.columnconfigure(0, weight=1, uniform="cols")
-        content.columnconfigure(1, weight=1, uniform="cols")
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(1, weight=1)
 
         # Header / App bar
         header = ttk.Frame(content, padding=(0, 0, 0, 6), style="Header.TFrame")
-        header.grid(row=0, column=0, columnspan=2, sticky="we")
+        header.grid(row=0, column=0, sticky="we")
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Madakappy", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
         btn_bar = ttk.Frame(header, style="Header.TFrame")
@@ -93,9 +92,22 @@ class ImageSelectorApp(ttk.Frame):
         ttk.Button(btn_bar, text="Help", command=self._on_help, width=8).grid(row=0, column=1)
         ttk.Label(header, text="Segmentation and Classification", font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", pady=(2,0))
 
+        self.notebook = ttk.Notebook(content)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
+        content.rowconfigure(1, weight=1)
+
+        workflow_tab = ttk.Frame(self.notebook, padding=(0, 0, 0, 0), style="Content.TFrame")
+        workflow_tab.columnconfigure(0, weight=1)
+        workflow_tab.rowconfigure(1, weight=1)
+        self.notebook.add(workflow_tab, text="Workflow")
+
+        self.train_tab = ttk.Frame(self.notebook, padding=(16, 12), style="Content.TFrame")
+        self.train_tab.columnconfigure(0, weight=1)
+        self.notebook.add(self.train_tab, text="Train Model")
+
         # Stepper
-        self.stepper = ttk.Frame(content, padding=(0, 0, 0, 10), style="Header.TFrame")
-        self.stepper.grid(row=1, column=0, columnspan=2, sticky="we")
+        self.stepper = ttk.Frame(workflow_tab, padding=(0, 0, 0, 10), style="Header.TFrame")
+        self.stepper.grid(row=0, column=0, sticky="we")
         self._step_labels = [
             ttk.Label(self.stepper, text="1. Segmentation", style="Step.Pending.TLabel"),
             ttk.Label(self.stepper, text="2. Model", style="Step.Pending.TLabel"),
@@ -107,9 +119,16 @@ class ImageSelectorApp(ttk.Frame):
                 ttk.Label(self.stepper, text="→", style="Step.Separator.TLabel").grid(row=0, column=2*i+1, padx=6)
         self._update_stepper(state=0)
 
+        # Main workflow content
+        workflow_body = ttk.Frame(workflow_tab, style="Content.TFrame")
+        workflow_body.grid(row=1, column=0, sticky="nsew")
+        workflow_body.columnconfigure(0, weight=1, uniform="cols")
+        workflow_body.columnconfigure(1, weight=1, uniform="cols")
+        workflow_body.rowconfigure(0, weight=1)
+
         # Left column
-        left = ttk.Frame(content, style="Content.TFrame")
-        left.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        left = ttk.Frame(workflow_body, style="Content.TFrame")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         left.columnconfigure(0, weight=1)
 
         io = ttk.LabelFrame(left, text="Project Paths", style="Section.TLabelframe")
@@ -188,43 +207,21 @@ class ImageSelectorApp(ttk.Frame):
         # No per-step run button; a single workflow button is provided in footer
 
         # Right column
-        right = ttk.Frame(content, style="ContentAlt.TFrame")
-        right.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+        right = ttk.Frame(workflow_body, style="ContentAlt.TFrame")
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         right.columnconfigure(0, weight=1)
 
-        clf = ttk.LabelFrame(right, text="Classification", style="SectionAlt.TLabelframe")
+        clf = ttk.LabelFrame(right, text="Model Selection", style="SectionAlt.TLabelframe")
         clf.grid(row=0, column=0, sticky="we")
-        for i in range(6):
-            clf.columnconfigure(i, weight=1)
-        ttk.Label(clf, text="Mode").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Radiobutton(clf, text="Use existing model", variable=self.var_model_mode, value="existing", command=self._toggle_model_mode).grid(row=0, column=1, sticky="w", padx=6, pady=4)
-        ttk.Radiobutton(clf, text="Train new model", variable=self.var_model_mode, value="train", command=self._toggle_model_mode).grid(row=0, column=2, sticky="w", padx=6, pady=4)
-
-        # Existing model frame
-        self.frm_existing = ttk.Frame(clf)
-        self.frm_existing.grid(row=1, column=0, columnspan=6, sticky="we")
-        self.frm_existing.columnconfigure(1, weight=1)
-        ttk.Label(self.frm_existing, text="Model (.joblib)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(self.frm_existing, textvariable=self.var_model_path).grid(row=0, column=1, sticky="we", padx=6, pady=4)
-        ttk.Button(self.frm_existing, text="Browse…", command=self._on_browse_model).grid(row=0, column=2, padx=6, pady=4)
-
-        # Training frame
-        self.frm_train = ttk.Frame(clf)
-        self.frm_train.grid(row=2, column=0, columnspan=6, sticky="we")
-        for i in range(3):
-            self.frm_train.columnconfigure(i, weight=1)
-        ttk.Label(self.frm_train, text="Training polygons").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(self.frm_train, textvariable=self.var_train_path).grid(row=0, column=1, sticky="we", padx=6, pady=4)
-        ttk.Button(self.frm_train, text="📁 Browse", command=self._on_browse_training).grid(row=0, column=2, padx=6, pady=4)
-        ttk.Label(self.frm_train, text="Class column").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-        self.cmb_class_col = ttk.Combobox(self.frm_train, textvariable=self.var_class_col, state="readonly")
-        self.cmb_class_col.grid(row=1, column=1, sticky="w", padx=6, pady=4)
-        ttk.Button(self.frm_train, text="Load Fields", command=self._load_training_columns).grid(row=1, column=2, padx=6, pady=4)
-        ttk.Label(self.frm_train, text="Max pixels per class (train)").grid(row=2, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(self.frm_train, textvariable=self.var_max_pixels_per_class, width=12).grid(row=2, column=1, sticky="w", padx=6, pady=4)
-        ttk.Button(self.frm_train, text="Train Model", command=self._on_train_model).grid(row=2, column=2, padx=6, pady=4)
-        self.lbl_training_info = ttk.Label(self.frm_train, text="", foreground="#666")
-        self.lbl_training_info.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+        clf.columnconfigure(1, weight=1)
+        ttk.Label(clf, text="Model (.joblib)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(clf, textvariable=self.var_model_path).grid(row=0, column=1, sticky="we", padx=6, pady=4)
+        ttk.Button(clf, text="Browse…", command=self._on_browse_model).grid(row=0, column=2, padx=6, pady=4)
+        ttk.Button(
+            clf,
+            text="Need a model? Open training tab →",
+            command=lambda: self.notebook.select(self.train_tab),
+        ).grid(row=1, column=0, columnspan=3, sticky="we", padx=6, pady=(2, 4))
 
         # Confusion matrix preview
         self.cm_label = ttk.Label(right, style="ContentAlt.TLabel")
@@ -239,8 +236,8 @@ class ImageSelectorApp(ttk.Frame):
         # Apply happens as part of full workflow
 
         # Footer / status
-        footer = ttk.Frame(content, padding=(0, 8, 0, 0), style="Footer.TFrame")
-        footer.grid(row=2, column=0, columnspan=2, sticky="we")
+        footer = ttk.Frame(workflow_tab, padding=(0, 8, 0, 0), style="Footer.TFrame")
+        footer.grid(row=2, column=0, sticky="we")
         footer.columnconfigure(0, weight=1)
         self.status = ttk.Label(footer, text="Ready", foreground="#444")
         self.status.grid(row=0, column=0, sticky="w")
@@ -253,7 +250,47 @@ class ImageSelectorApp(ttk.Frame):
         self.run_btn = ttk.Button(footer, text="▶ Run Workflow", command=self._on_run_workflow, style="Primary.TButton")
         self.run_btn.grid(row=0, column=4, sticky="e")
 
-        self._toggle_model_mode()
+        # Training tab layout
+        ttk.Label(
+            self.train_tab,
+            text="Train a new Random Forest model from labeled polygons. "
+                 "Once training completes, the model is available on the Workflow tab.",
+            wraplength=640,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        train_form = ttk.LabelFrame(self.train_tab, text="Training Inputs", style="Section.TLabelframe")
+        train_form.grid(row=1, column=0, sticky="nwe")
+        train_form.columnconfigure(1, weight=1)
+
+        ttk.Label(train_form, text="Training image").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(train_form, textvariable=self.var_train_raster).grid(row=0, column=1, sticky="we", padx=6, pady=6)
+        ttk.Button(train_form, text="📁 Browse", command=self._on_pick_training_raster).grid(row=0, column=2, padx=6, pady=6)
+
+        ttk.Label(train_form, text="Training polygons").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(train_form, textvariable=self.var_train_path).grid(row=1, column=1, sticky="we", padx=6, pady=6)
+        ttk.Button(train_form, text="📁 Browse", command=self._on_browse_training).grid(row=1, column=2, padx=6, pady=6)
+
+        ttk.Label(train_form, text="Class column").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        self.cmb_class_col = ttk.Combobox(train_form, textvariable=self.var_class_col, state="readonly")
+        self.cmb_class_col.grid(row=2, column=1, sticky="we", padx=6, pady=6)
+        ttk.Button(train_form, text="Load Fields", command=self._load_training_columns).grid(row=2, column=2, padx=6, pady=6)
+
+        ttk.Label(train_form, text="Max pixels per class").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(train_form, textvariable=self.var_max_pixels_per_class, width=12).grid(row=3, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(
+            train_form,
+            text="If a class exceeds this limit, pixels are randomly sampled to match the count.",
+            foreground="#666",
+            wraplength=420,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
+        self.lbl_training_info = ttk.Label(train_form, text="", foreground="#666")
+        self.lbl_training_info.grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
+        ttk.Button(self.train_tab, text="Train Model", command=self._on_train_model, style="Primary.TButton").grid(
+            row=2, column=0, sticky="w", pady=(12, 0)
+        )
+
         # Shortcuts
         try:
             self.master.bind('<F5>', lambda e: self._on_run_workflow())
@@ -289,17 +326,6 @@ class ImageSelectorApp(ttk.Frame):
         self.status.configure(text=text)
         self._toast(text, kind="info", duration_ms=1800)
 
-    def _toggle_model_mode(self) -> None:
-        mode = self.var_model_mode.get()
-        if mode == "train":
-            self.frm_train.grid()
-            self.frm_existing.grid_remove()
-            self._update_stepper(state=1)
-        else:
-            self.frm_existing.grid()
-            self.frm_train.grid_remove()
-            self._update_stepper(state=1)
-
     # ─────────── IO pickers ───────────
     def _on_pick_in_raster(self) -> None:
         path = filedialog.askopenfilename(title="Select input raster", filetypes=[
@@ -307,8 +333,21 @@ class ImageSelectorApp(ttk.Frame):
             ("All files", "*.*"),
         ])
         if path:
+            prev = self.var_in_raster.get()
             self.var_in_raster.set(path)
+            train_val = (self.var_train_raster.get() or "").strip()
+            if not train_val or train_val == prev:
+                self.var_train_raster.set(path)
             self._set_status("Input raster selected")
+
+    def _on_pick_training_raster(self) -> None:
+        path = filedialog.askopenfilename(title="Select training image", filetypes=[
+            ("GeoTIFF", "*.tif *.tiff"),
+            ("All files", "*.*"),
+        ])
+        if path:
+            self.var_train_raster.set(path)
+            self._set_status("Training image selected")
 
     def _on_pick_output(self) -> None:
         path = filedialog.askdirectory(title="Select output directory")
@@ -432,70 +471,25 @@ class ImageSelectorApp(ttk.Frame):
                 self.after(0, lambda: self._on_workflow_failed(f"Segmentation failed: {e}"))
                 return
 
-            # Step 2: get model (existing or train)
-            mode = self.var_model_mode.get()
-            model_path: str | None = None
-            if mode == "existing":
-                model_path = self.var_model_path.get() or self._model_path
-                if not model_path or not os.path.exists(model_path):
-                    # Prompt once
-                    def pick_model():
-                        path = filedialog.askopenfilename(title="Select model file", filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")])
-                        return path
-                    model_path = self._blocking_dialog(pick_model)
-                if not model_path:
-                    self.after(0, lambda: self._on_workflow_failed("No model selected."))
-                    return
-                self._model_path = model_path
-                self.after(0, lambda: self._load_cm_preview_for_model(model_path))
-            else:
-                # Train new model
-                train_path = self.var_train_path.get()
-                if not train_path or not os.path.exists(train_path):
-                    def pick_train():
-                        return filedialog.askopenfilename(title="Select training polygons", filetypes=[("Vector files", "*.shp *.gpkg *.geojson"), ("All files", "*.*")])
-                    train_path = self._blocking_dialog(pick_train)
-                    if not train_path:
-                        self.after(0, lambda: self._on_workflow_failed("No training polygons provided."))
-                        return
-                    self.var_train_path.set(train_path)
-                # Choose class column if missing
-                class_col = self.var_class_col.get()
-                if not class_col:
-                    try:
-                        gdf = gpd.read_file(train_path)
-                        cols = [c for c in gdf.columns if c.lower() != "geometry"]
-                    except Exception:
-                        cols = []
-                    if not cols:
-                        self.after(0, lambda: self._on_workflow_failed("No non-geometry fields in training data."))
-                        return
-                    class_col = self._blocking_pick_class_col(cols)
-                    if not class_col:
-                        self.after(0, lambda: self._on_workflow_failed("No class column selected."))
-                        return
-                    self.var_class_col.set(class_col)
+            self.after(0, lambda: self._update_stepper(1))
 
-                cap = 0
-                try:
-                    cap = int(self.var_max_pixels_per_class.get() or 0)
-                except Exception:
-                    cap = 0
-                try:
-                    res = train_model_from_training_polys(
-                        session.seg_in_raster,
-                        train_path,
-                        class_col,
-                        session.output_dir,
-                        progress=make_cb("Training"),
-                        max_pixels_per_class=(cap if cap > 0 else None),
+            # Step 2: get model (selection only)
+            model_path: str | None = self.var_model_path.get() or self._model_path
+            if not model_path or not os.path.exists(model_path):
+                # Prompt once
+                def pick_model():
+                    return filedialog.askopenfilename(
+                        title="Select model file",
+                        filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")],
                     )
-                    model_path = str(res.model_path)
-                    self._model_path = model_path
-                    self.after(0, lambda: self._post_training_preview(res))
-                except Exception as e:
-                    self.after(0, lambda: self._on_workflow_failed(f"Training failed: {e}"))
-                    return
+                model_path = self._blocking_dialog(pick_model)
+            if not model_path:
+                self.after(0, lambda: self._on_workflow_failed("No model selected."))
+                return
+            self._model_path = model_path
+            self.var_model_path.set(model_path)
+            self.after(0, lambda: self._load_cm_preview_for_model(model_path))
+            self.after(0, lambda: self._update_stepper(2))
 
             # Step 3: apply
             try:
@@ -631,11 +625,13 @@ class ImageSelectorApp(ttk.Frame):
     def _on_workflow_done(self, out_path: str) -> None:
         self._set_status("Workflow complete")
         self._set_controls_state("normal")
+        self._update_stepper(0)
         messagebox.showinfo("Done", f"Classification written to:\n{out_path}")
 
     def _on_workflow_failed(self, msg: str) -> None:
         self._set_controls_state("normal")
         self._set_status(msg)
+        self._update_stepper(0)
         messagebox.showerror("Workflow failed", msg)
 
     # ─────────── App bar + UX helpers ───────────
@@ -643,7 +639,11 @@ class ImageSelectorApp(ttk.Frame):
         messagebox.showinfo("Settings", "Settings will go here.")
 
     def _on_help(self) -> None:
-        messagebox.showinfo("Help", "1) Set paths 2) Choose mode 3) Run Workflow.")
+        messagebox.showinfo(
+            "Help",
+            "1) Set project paths 2) (Optional) use the Train Model tab to create a model "
+            "3) Select the model on the Workflow tab 4) Run the workflow.",
+        )
 
     def _update_stepper(self, state: int) -> None:
         for i, lab in enumerate(self._step_labels):
@@ -756,15 +756,23 @@ class ImageSelectorApp(ttk.Frame):
             messagebox.showerror("Load failed", f"Could not read training polygons: {e}")
 
     def _on_train_model(self) -> None:
-        if self.var_model_mode.get() != "train":
+        train_raster = (self.var_train_raster.get() or "").strip() or (self.var_in_raster.get() or "").strip()
+        train_path = (self.var_train_path.get() or "").strip()
+        class_col = (self.var_class_col.get() or "").strip()
+        if not train_raster:
+            messagebox.showwarning("Missing image", "Select a training image before launching training.")
             return
-        train_path = self.var_train_path.get()
-        class_col = self.var_class_col.get()
-        if not train_path or not class_col:
-            messagebox.showwarning("Missing inputs", "Pick training polygons and select class column")
+        if not train_path:
+            messagebox.showwarning("Missing polygons", "Pick training polygons to continue.")
             return
-        in_raster = self.var_in_raster.get()
+        if not class_col:
+            messagebox.showwarning("Missing class column", "Select the column holding the class names.")
+            return
         out_root = self.output_dir or self.out_entry.get()
+        if not out_root:
+            messagebox.showwarning("Missing output", "Set an output directory in Project Paths.")
+            return
+        self._train_start = None
         self._set_status("Training model…")
 
         def cb(done: int, total: int, note: str = ""):
@@ -781,7 +789,7 @@ class ImageSelectorApp(ttk.Frame):
                 except Exception:
                     cap = 0
                 res = train_model_from_training_polys(
-                    in_raster,
+                    train_raster,
                     train_path,
                     class_col,
                     out_root,
@@ -791,17 +799,10 @@ class ImageSelectorApp(ttk.Frame):
                 self._model_path = str(res.model_path)
                 def ok():
                     self._set_status("Training complete")
-                    # Show confusion matrix
-                    try:
-                        if res.cm_path and Path(res.cm_path).exists():
-                            im = Image.open(res.cm_path)
-                            im.thumbnail((800, 600))
-                            self._cm_photo = ImageTk.PhotoImage(im)
-                            self.cm_label.configure(image=self._cm_photo)
-                    except Exception:
-                        pass
+                    self.var_model_path.set(self._model_path)
+                    self._post_training_preview(res)
                     messagebox.showinfo("Model saved", f"Saved → {self._model_path}")
-            
+
                 self.after(0, ok)
             except Exception as e:
                 msg = str(e)
@@ -834,8 +835,7 @@ class ImageSelectorApp(ttk.Frame):
     # ─────────── Apply model ───────────
     def _on_apply_model(self) -> None:
         # Resolve model path: either trained or existing
-        if self.var_model_mode.get() == "existing":
-            self._model_path = self.var_model_path.get() or self._model_path
+        self._model_path = self.var_model_path.get() or self._model_path
         if not self._model_path:
             messagebox.showwarning("No model", "Provide a model (train or select existing)")
             return
