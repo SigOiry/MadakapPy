@@ -1,7 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import threading
+import json
+import shutil
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -20,8 +24,8 @@ def run_flet_app() -> None:
         apply_model_with_pixel_sampling,
     )
     import numpy as np
+    import pandas as pd
     import geopandas as gpd
-    import folium
     import rasterio
     from rasterio.warp import transform_bounds
     from PIL import Image
@@ -140,6 +144,82 @@ def run_flet_app() -> None:
         ], spacing=6)
         return ft.Row([ft.Container(lbl_core, width=230), ft.Container(control, expand=True)])
 
+    _EDIT_SERVERS: dict[str, tuple[ThreadingHTTPServer, threading.Thread, int]] = {}
+
+    def _purge_shapefile(base_path: Path) -> None:
+        suffixes = [".shp", ".shx", ".dbf", ".prj", ".cpg", ".shp.xml"]
+        stem = base_path.with_suffix("")
+        for suf in suffixes:
+            try:
+                target = stem.with_suffix(suf)
+                if target.exists():
+                    target.unlink()
+            except Exception:
+                pass
+
+    def _cleanup_root_tiffs() -> None:
+        try:
+            root = Path.cwd()
+            for tif in root.glob("*.tif"):
+                try:
+                    tif.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _ensure_edit_server(shp_path: Path, target_crs: str | None) -> int:
+        key = str(shp_path.resolve())
+        if key in _EDIT_SERVERS:
+            return _EDIT_SERVERS[key][2]
+
+        class _EditHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                return
+
+            def _set_headers(self) -> None:
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+            def do_OPTIONS(self) -> None:  # noqa: N802
+                self.send_response(204)
+                self._set_headers()
+                self.end_headers()
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                    feats = payload.get("features", [])
+                    tgt = target_crs or "EPSG:4326"
+                    if feats:
+                        gdf_new = gpd.GeoDataFrame.from_features(feats, crs="EPSG:4326")
+                        if tgt and str(gdf_new.crs) != str(tgt):
+                            gdf_new = gdf_new.to_crs(tgt)
+                        _purge_shapefile(shp_path)
+                        gdf_new.to_file(shp_path)
+                        resp = {"status": "ok", "saved": len(gdf_new)}
+                    else:
+                        _purge_shapefile(shp_path)
+                        resp = {"status": "ok", "saved": 0}
+                    self.send_response(200)
+                except Exception as exc:  # noqa: BLE001
+                    resp = {"status": "error", "message": str(exc)}
+                    self.send_response(500)
+                self._set_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(resp).encode("utf-8"))
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _EditHandler)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        _EDIT_SERVERS[key] = (httpd, thread, port)
+        return port
+
+
     def build_preview_html(aoi_path: str, raster_path: str) -> Optional[str]:
         try:
             gdf = gpd.read_file(aoi_path)
@@ -177,18 +257,136 @@ def run_flet_app() -> None:
             except Exception:
                 gdf_wgs = gdf
 
-            m = folium.Map()
-            folium.raster_layers.ImageOverlay(
-                image=f"data:image/png;base64,{b64_png}",
-                bounds=[[south, west], [north, east]],
-                opacity=1.0,
-            ).add_to(m)
-            folium.GeoJson(
-                data=gdf_wgs.__geo_interface__,
-                style_function=lambda _: {"color": "yellow", "weight": 1, "fillColor": "yellow", "fillOpacity": 0.25},
-            ).add_to(m)
-            m.fit_bounds([[south, west], [north, east]])
-            html = m.get_root().render()
+            geojson = json.dumps(gdf_wgs.__geo_interface__)
+            bounds_json = json.dumps([[south, west], [north, east]])
+            port = _ensure_edit_server(Path(aoi_path), str(gdf.crs) if gdf.crs else "EPSG:4326")
+
+            template = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AOI Editor</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.13.0/dist/leaflet-geoman.css" />
+  <style>
+    html, body, #map { width: 100%; height: 100%; margin: 0; padding: 0; }
+    .toolbar { position: absolute; top: 10px; right: 10px; display: flex; gap: 8px; align-items: center; font-family: sans-serif; }
+    #saveBtn { padding: 6px 12px; border: none; border-radius: 6px; background: #0b8457; color: #fff; cursor: pointer; font-weight: 600; }
+    #saveBtn:hover { background: #0a704a; }
+    .status { padding: 6px 10px; border-radius: 6px; color: #fff; background: rgba(0,0,0,0.6); }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="toolbar">
+    <button id="saveBtn" title="Write current polygons to the shapefile.">Save edits</button>
+    <div class="status" id="status">Ready</div>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.13.0/dist/leaflet-geoman.min.js"></script>
+  <script>
+    const imageBounds = __IMAGE_BOUNDS__;
+    const imageData = "data:image/png;base64,__IMAGE_DATA__";
+    const initialGeoJson = __GEOJSON__;
+    const SAVE_URL = "__SAVE_URL__";
+
+    const map = L.map('map', { maxZoom: 22 });
+    L.imageOverlay(imageData, imageBounds).addTo(map);
+    const drawnItems = L.featureGroup().addTo(map);
+
+    L.geoJSON(initialGeoJson, {
+      style: () => ({ color: "yellow", weight: 1, fillColor: "yellow", fillOpacity: 0.25 })
+    }).eachLayer(layer => {
+      drawnItems.addLayer(layer);
+    });
+
+    const statusEl = document.getElementById("status");
+    const saveBtn = document.getElementById("saveBtn");
+    let dirty = false;
+
+    function setStatus(text, ok=true) {
+      statusEl.textContent = text;
+      statusEl.style.background = ok ? "rgba(0, 123, 67, 0.8)" : "rgba(176, 0, 32, 0.8)";
+    }
+
+    function markDirty() {
+      dirty = true;
+      setStatus("Edits pending - click Save", false);
+    }
+
+    const bounds = drawnItems.getBounds();
+    if (bounds.isValid()) {
+      map.fitBounds(bounds);
+    } else {
+      map.fitBounds(imageBounds);
+    }
+
+    map.pm.addControls({
+      position: "topleft",
+      drawMarker: false,
+      drawCircle: false,
+      drawCircleMarker: false,
+      drawPolyline: false,
+      drawRectangle: true,
+      cutPolygon: true,
+      editMode: true,
+      dragMode: true,
+      removalMode: true
+    });
+
+    map.on("pm:create", e => {
+      drawnItems.addLayer(e.layer);
+      markDirty();
+    });
+    map.on("pm:remove", e => {
+      if (e.layer && drawnItems.hasLayer(e.layer)) {
+        drawnItems.removeLayer(e.layer);
+      }
+      markDirty();
+    });
+    const dirtyEvents = ["pm:update", "pm:cut", "pm:edit", "pm:dragend", "pm:rotateend"];
+    dirtyEvents.forEach(evt => map.on(evt, markDirty));
+
+    function saveGeoJSON() {
+      setStatus("Saving...", true);
+      const features = [];
+      drawnItems.eachLayer(layer => {
+        try {
+          features.push(layer.toGeoJSON());
+        } catch (err) {
+          console.error(err);
+        }
+      });
+      const fc = { type: "FeatureCollection", features };
+      fetch(SAVE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(fc)
+      })
+        .then(resp => resp.json())
+        .then(data => {
+          if (data.status === "ok") {
+            setStatus("Saved polygons: " + data.saved, true);
+            dirty = false;
+          } else {
+            setStatus("Save failed: " + data.message, false);
+          }
+        })
+        .catch(err => {
+          console.error(err);
+          setStatus("Save failed", false);
+        });
+    }
+    saveBtn.addEventListener("click", saveGeoJSON);
+  </script>
+</body>
+</html>"""
+            html = (
+                template.replace("__IMAGE_BOUNDS__", bounds_json)
+                .replace("__IMAGE_DATA__", b64_png)
+                .replace("__GEOJSON__", geojson)
+                .replace("__SAVE_URL__", f"http://127.0.0.1:{port}/")
+            )
             out_html = Path(aoi_path).parent / "preselection_preview.html"
             out_html.write_text(html, encoding="utf-8")
             return str(out_html)
@@ -251,6 +449,12 @@ def run_flet_app() -> None:
         step_text = ft.Text("Ready", size=12, color=pal["muted"]) 
         progress = ft.ProgressBar(value=0.0, color=pal["primary"], bgcolor=pal["border"]) 
         result_text = ft.Text("", selectable=True, color=pal["muted"]) 
+        workflow_gate: dict[str, threading.Event | None] = {"event": None}
+        confirm_btn = ft.ElevatedButton(
+            "Confirm polygons and continue",
+            visible=False,
+            disabled=True,
+        )
 
         def _field_float(field: ft.TextField, default: float | None = None) -> float | None:
             txt = (field.value or "").strip()
@@ -293,9 +497,33 @@ def run_flet_app() -> None:
                         dlg.open = True
                 elif kind == "result":
                     result_text.value = msg.get("text", "")
+                elif kind == "workflow_done":
+                    step_text.value = msg.get("text", "Workflow complete")
+                    progress.value = 0.0
+                    result_text.value = msg.get("text", "Workflow complete")
+                    confirm_btn.visible = False
+                    confirm_btn.disabled = True
+                elif kind == "await_polygons":
+                    step_text.value = msg.get("text", "Review polygons")
+                    detail = msg.get("detail")
+                    if detail:
+                        result_text.value = detail
+                    confirm_btn.visible = True
+                    confirm_btn.disabled = False
                 page.update()
             except Exception:
                 pass
+
+        def _on_confirm_polygons(_):
+            event = workflow_gate.get("event")
+            if event:
+                workflow_gate["event"] = None
+                confirm_btn.disabled = True
+                confirm_btn.visible = False
+                result_text.value = "Polygons confirmed. Continuing workflow..."
+                page.update()
+                event.set()
+        confirm_btn.on_click = _on_confirm_polygons
 
         page.pubsub.subscribe(on_msg)
         tabs_ref: ft.Ref[ft.Tabs] = ft.Ref()
@@ -376,6 +604,10 @@ def run_flet_app() -> None:
             threading.Thread(target=worker, daemon=True).start()
 
         def run_workflow(_):
+            confirm_btn.visible = False
+            confirm_btn.disabled = True
+            workflow_gate["event"] = None
+            page.update()
             if not in_raster.value.strip() or not output_dir.value.strip() or not os.path.exists(otb_bin.value.strip()):
                 step_text.value = "Set input raster, output directory and a valid OTB path"; page.update(); return
             if not (model_path.value or "").strip():
@@ -406,38 +638,140 @@ def run_flet_app() -> None:
                     path = build_preview_html(aoi_final, in_raster.value.strip())
                     if path:
                         page.pubsub.send_all({"kind": "preview", "path": path})
+                    confirm_event = threading.Event()
+                    workflow_gate["event"] = confirm_event
+                    page.pubsub.send_all({
+                        "kind": "await_polygons",
+                        "text": "Review polygons and click Confirm to continue.",
+                        "detail": f"Preselection saved to: {aoi_final}",
+                    })
+                    confirm_event.wait()
+                    workflow_gate["event"] = None
 
-                    # Segmentation
-                    seg_res = run_segmentation(
-                        in_raster=in_raster.value.strip(),
-                        output_root=output_dir.value.strip(),
-                        otb_bin=otb_bin.value.strip(),
-                        aoi_path=aoi_final,
-                        progress=lambda d,t,n: page.pubsub.send_all({"kind":"progress","text": "Segmentation", "ratio": (0 if t==0 else d/max(1,t))}),
-                    )
-                    final_seg_path = seg_res.out_shp
-                    aoi_note = ""
-                    if aoi_final and os.path.exists(aoi_final):
+                    # Parse segmentation parameters
+                    def _safe_int(field, default: int) -> int:
                         try:
-                            seg_gdf = gpd.read_file(seg_res.out_shp)
-                            aoi_gdf = gpd.read_file(aoi_final)
-                            if len(seg_gdf) > 0 and len(aoi_gdf) > 0:
-                                if seg_gdf.crs and aoi_gdf.crs and str(seg_gdf.crs) != str(aoi_gdf.crs):
-                                    aoi_gdf = aoi_gdf.to_crs(seg_gdf.crs)
-                                clipped = gpd.sjoin(seg_gdf, aoi_gdf, predicate="intersects", how="inner")
-                                if "index_right" in clipped.columns:
-                                    clipped = clipped.drop(columns=["index_right"])
-                                clipped = clipped.loc[~clipped.geometry.is_empty].reset_index(drop=True)
-                                if len(clipped) > 0:
-                                    filtered = seg_res.out_dir / f"{seg_res.out_shp.stem}_AOI.shp"
-                                    clipped.to_file(filtered)
-                                    final_seg_path = filtered
-                                    aoi_note = f"\nAOI-filtered segments: {len(clipped)}"
-                                else:
-                                    aoi_note = "\nAOI filter returned zero segments."
-                        except Exception as aoi_err:
-                            aoi_note = f"\nAOI filter failed: {aoi_err}"
-                    page.pubsub.send_all({"kind":"result","text": f"Segmentation done. Outputs in: {seg_res.out_dir}\nFinal segments: {final_seg_path}{aoi_note}"})
+                            txt = (field.value or "").strip()
+                            return int(txt) if txt else default
+                        except Exception:
+                            return default
+
+                    tile_sz = _safe_int(tile_size, 40)
+                    spatial = _safe_int(spatialr, 5)
+                    mins = _safe_int(minsize, 5)
+
+                    # Classification settings
+                    cap_pol = 0
+                    try:
+                        cap_pol = int(max_pixels_per_polygon.value or "0")
+                    except Exception:
+                        cap_pol = 0
+                    cap_pol = max(1, cap_pol) if cap_pol else 200
+                    model_file = (model_path.value or "").strip()
+                    if not model_file or not os.path.exists(model_file):
+                        raise RuntimeError("Selected model file does not exist")
+
+                    # Prepare AOI list
+                    if not aoi_final or not os.path.exists(aoi_final):
+                        raise RuntimeError("AOI file missing after preselection.")
+                    aoi_gdf = gpd.read_file(aoi_final)
+                    aoi_gdf = aoi_gdf.loc[~aoi_gdf.geometry.is_empty].reset_index(drop=True)
+                    if aoi_gdf is None or len(aoi_gdf) == 0:
+                        raise RuntimeError("No polygons to process after preselection.")
+
+                    run_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+                    base_out = Path(output_dir.value.strip())
+                    temp_root = base_out.parent if base_out.name.lower() == "output" else base_out
+                    work_dir = temp_root / "Temp" / f"workflow_{run_ts}"
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    work_dir.mkdir(parents=True, exist_ok=True)
+
+                    seg_frames: list[gpd.GeoDataFrame] = []
+                    seg_counter = 1
+                    n_aoi = len(aoi_gdf)
+                    for idx, geom in enumerate(aoi_gdf.geometry, start=1):
+                        if geom is None or geom.is_empty:
+                            continue
+                        single = gpd.GeoDataFrame({"geometry": [geom]}, crs=aoi_gdf.crs)
+                        single_path = work_dir / f"aoi_{idx}.shp"
+                        single.to_file(single_path)
+
+                        page.pubsub.send_all(
+                            {"kind": "result", "text": f"AOI {idx}/{n_aoi}: running segmentation"}
+                        )
+                        seg_res = run_segmentation(
+                            in_raster=in_raster.value.strip(),
+                            output_root=str(work_dir / f"seg_run_{idx}"),
+                            otb_bin=otb_bin.value.strip(),
+                            tile_size_m=tile_sz,
+                            spatialr=spatial,
+                            minsize=mins,
+                            aoi_path=str(single_path),
+                            progress=lambda d, t, n, i=idx: page.pubsub.send_all(
+                                {
+                                    "kind": "progress",
+                                    "text": f"Segmentation (AOI {i}/{n_aoi})",
+                                    "ratio": (0 if t == 0 else d / max(1, t)),
+                                }
+                            ),
+                        )
+                        final_seg_path = seg_res.out_shp
+                        try:
+                            seg_gdf = gpd.read_file(final_seg_path)
+                            seg_gdf = seg_gdf.loc[~seg_gdf.geometry.is_empty].reset_index(drop=True)
+                            seg_len = len(seg_gdf)
+                            if seg_len > 0:
+                                drop_cols = [c for c in seg_gdf.columns if c.lower().startswith(("var", "mean"))]
+                                if drop_cols:
+                                    seg_gdf = seg_gdf.drop(columns=drop_cols, errors="ignore")
+                                seg_gdf["seg_id"] = np.arange(seg_counter, seg_counter + seg_len, dtype=np.int64)
+                                seg_counter += seg_len
+                                seg_frames.append(seg_gdf)
+                        except Exception as seg_err:
+                            page.pubsub.send_all(
+                                {"kind": "result", "text": f"Warning: could not prepare segments for AOI {idx}: {seg_err}"}
+                            )
+                        page.pubsub.send_all(
+                            {"kind": "result", "text": f"AOI {idx}/{n_aoi}: segmentation complete"}
+                        )
+
+                    if not seg_frames:
+                        raise RuntimeError("No segments produced for classification.")
+
+                    combined = gpd.GeoDataFrame(
+                        pd.concat(seg_frames, ignore_index=True),
+                        crs=seg_frames[0].crs if hasattr(seg_frames[0], "crs") else None,
+                    )
+                    combined_path = work_dir / "combined_segments.shp"
+                    combined.to_file(combined_path)
+
+                    page.pubsub.send_all({"kind": "result", "text": "Segments merged. Running classification..."})
+
+                    try:
+                        cls_res = apply_model_with_pixel_sampling(
+                            in_raster.value.strip(),
+                            str(combined_path),
+                            model_file,
+                            output_dir.value.strip(),
+                            max_pixels_per_polygon=cap_pol,
+                            progress=lambda d, t, n: page.pubsub.send_all(
+                                {
+                                    "kind": "progress",
+                                    "text": "Classifying",
+                                    "ratio": (0 if t == 0 else d / max(1, t)),
+                                }
+                            ),
+                        )
+                        page.pubsub.send_all(
+                            {
+                                "kind": "result",
+                                "text": f"Workflow complete. Classification saved to:\n{cls_res.output_path}",
+                            }
+                        )
+                        _cleanup_root_tiffs()
+                        page.pubsub.send_all({"kind": "workflow_done", "text": "Workflow complete."})
+                    finally:
+                        shutil.rmtree(work_dir, ignore_errors=True)
                 except Exception as ex:  # noqa: BLE001
                     page.pubsub.send_all({"kind":"result","text": f"Workflow failed: {ex}"})
             threading.Thread(target=worker, daemon=True).start()
@@ -546,7 +880,7 @@ def run_flet_app() -> None:
             try:
                 files = sorted(p for p in root.glob("*.joblib")) if root.exists() else []
                 if files:
-                    options = [ft.dropdown.Option(fp.name, key=str(fp.resolve())) for fp in files]
+                    options = [ft.dropdown.Option(text=fp.name, key=str(fp.resolve())) for fp in files]
                     current_keys = {opt.key or opt.text for opt in options}
                     if model_path.value not in current_keys:
                         first = options[0]
@@ -635,7 +969,7 @@ def run_flet_app() -> None:
                 step_text.value = "Set an output directory first"
                 page.update()
                 return
-            step_text.value = "Training model…"
+            step_text.value = "Training model..."
             page.update()
 
             def progress_cb(done: int, total: int, note: str = "") -> None:
@@ -797,13 +1131,19 @@ def run_flet_app() -> None:
             ],
         )
 
+        result_panel = ft.Column(
+            [result_text, confirm_btn],
+            spacing=6,
+            horizontal_alignment=ft.CrossAxisAlignment.START,
+        )
+
         page.add(
             ft.Column(
                 [
                     tabs,
                     ft.Container(step_text, padding=10),
                     ft.Container(progress, padding=8),
-                    result_text,
+                    result_panel,
                 ],
                 expand=True,
                 spacing=8,
@@ -818,6 +1158,8 @@ def run_flet_app() -> None:
 
 if __name__ == "__main__":
     run_flet_app()
+
+
 
 
 

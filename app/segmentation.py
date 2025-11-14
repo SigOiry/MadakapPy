@@ -13,6 +13,7 @@ from typing import Callable, Optional, Tuple
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio import features as rio_features
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -120,13 +121,10 @@ def run_segmentation(
         rows = math.ceil(H / tile_px)
         total = cols * rows
         aoi_mask = None
-        tile_box = None
         if aoi_path_str:
             try:
                 import geopandas as gpd
-                from shapely.geometry import box as shapely_box
                 from shapely.ops import unary_union
-                from shapely.prepared import prep
             except Exception as e:  # pragma: no cover - optional dependency guard
                 raise RuntimeError("AOI filtering requires GeoPandas/Shapely.") from e
             aoi_gdf = gpd.read_file(aoi_path_str)
@@ -139,9 +137,16 @@ def run_segmentation(
                     if geom is not None and not geom.is_empty
                 ]
                 if geoms:
+                    # Rasterized AOI mask in full image space (1 inside AOI, 0 outside)
                     union_geom = unary_union(geoms)
-                    aoi_mask = prep(union_geom)
-                    tile_box = shapely_box
+                    aoi_mask = rio_features.rasterize(
+                        [(union_geom, 1)],
+                        out_shape=(H, W),
+                        transform=src.transform,
+                        fill=0,
+                        all_touched=False,
+                        dtype="uint8",
+                    )
 
         if progress:
             progress(0, total, "Initializing tiles...")
@@ -161,10 +166,11 @@ def run_segmentation(
                 window = rasterio.windows.Window(x0, y0, w, h)
                 transform = src.window_transform(window)
 
-                if aoi_mask is not None and tile_box is not None:
-                    bounds = rasterio.windows.bounds(window, src.transform)
-                    tile_geom = tile_box(*bounds)
-                    if tile_geom.is_empty or not aoi_mask.intersects(tile_geom):
+                # Skip tiles that have no AOI pixels at all
+                tile_aoi = None
+                if aoi_mask is not None:
+                    tile_aoi = aoi_mask[int(y0) : int(y0 + h), int(x0) : int(x0 + w)]
+                    if tile_aoi.size == 0 or not np.any(tile_aoi):
                         done += 1
                         if progress:
                             progress(done, total, "Skipping tile outside AOI.")
@@ -183,6 +189,12 @@ def run_segmentation(
                 with rasterio.open(tile_path, "w", **profile) as dst:
                     for b in range(1, src.count + 1):
                         data = src.read(b, window=window)
+                        # If AOI is provided, zero-out pixels outside AOI in this tile
+                        if tile_aoi is not None:
+                            mask = tile_aoi == 0
+                            if mask.any():
+                                data = data.copy()
+                                data[mask] = 0
                         dst.write(data, b)
 
                 # Write per-tile segments into Temp
@@ -266,14 +278,49 @@ def run_segmentation(
         try:
             # Prefer Python merge via GeoPandas (available in env)
             import geopandas as gpd
+
             gdfs = []
             for p in segs_paths:
                 try:
                     gdfs.append(gpd.read_file(p))
                 except Exception:
                     continue
+
             if gdfs:
-                merged_gdf = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs if hasattr(gdfs[0], 'crs') else None)
+                merged_gdf = gpd.GeoDataFrame(
+                    pd.concat(gdfs, ignore_index=True),
+                    crs=gdfs[0].crs if hasattr(gdfs[0], "crs") else None,
+                )
+
+                # Drop polygons whose meanBx fields are zero
+                mean_cols = [c for c in merged_gdf.columns if c.lower().startswith("mean")]
+                if mean_cols:
+                    keep_idx: list[int] = []
+                    for idx, row in merged_gdf[mean_cols].iterrows():
+                        drop = False
+                        for col in mean_cols:
+                            val = row[col]
+                            try:
+                                val_f = float(val)
+                            except Exception:
+                                continue
+                            if not np.isfinite(val_f):
+                                continue
+                            if val_f == 0.0:
+                                drop = True
+                                break
+                        if not drop:
+                            keep_idx.append(idx)
+                    if keep_idx:
+                        merged_gdf = merged_gdf.iloc[keep_idx].reset_index(drop=True)
+                    else:
+                        merged_gdf = merged_gdf.iloc[0:0]
+
+                merged_gdf = merged_gdf.reset_index(drop=True)
+                merged_gdf["seg_id"] = np.arange(1, len(merged_gdf) + 1, dtype="int64")
+                drop_cols = [c for c in merged_gdf.columns if c.lower().startswith(("var", "mean"))]
+                if drop_cols:
+                    merged_gdf = merged_gdf.drop(columns=drop_cols, errors="ignore")
                 merged_gdf.to_file(out_shp)
                 merged = out_shp
         except Exception:
@@ -284,7 +331,10 @@ def run_segmentation(
                     segs = [str(p) for p in segs_paths]
                     subprocess.run([ogr, "-skipfailures", str(out_shp), segs[0]], check=True)
                     for shp in segs[1:]:
-                        subprocess.run([ogr, "-skipfailures", "-update", "-append", str(out_shp), shp, "-nln", out_shp.stem], check=True)
+                        subprocess.run(
+                            [ogr, "-skipfailures", "-update", "-append", str(out_shp), shp, "-nln", out_shp.stem],
+                            check=True,
+                        )
                     merged = out_shp
             except Exception:
                 merged = None

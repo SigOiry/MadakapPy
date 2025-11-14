@@ -1,9 +1,0 @@
-{
-  "images": [],
-  "output_dir": "C:\\Users\\Simon\\Documents\\GiHub\\Madakappy\\Output",
-  "seg_in_raster": "C:/Users/Simon/Documents/GiHub/Madakappy/Data/All_cropped.tif",
-  "seg_tile_size_m": 40,
-  "seg_spatialr": 5,
-  "seg_minsize": 5,
-  "seg_otb_bin": "OTB/bin/otbcli_LargeScaleMeanShift.bat"
-}

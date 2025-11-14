@@ -6,11 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from collections import Counter, defaultdict
 
 import joblib
 import numpy as np
 import geopandas as gpd
 import rasterio
+from rasterio import features as rio_features
 from rasterio.mask import mask as rio_mask
 from shapely.geometry import mapping
 from sklearn.ensemble import RandomForestClassifier
@@ -51,6 +53,11 @@ def _rf_features_for_polygon(src: rasterio.io.DatasetReader, geom) -> np.ndarray
     data, _ = rio_mask(src, [mapping(geom)], crop=True, filled=False)
     data = data.astype("float32")
     data[(data == 0) | (data == 65535)] = np.nan
+    finite = np.isfinite(data)
+    if finite.any():
+        max_val = float(np.nanmax(data))
+        if max_val > 1.0:
+            data /= 65535.0
     means = [np.nanmean(band) for band in data]
     # Handle empty (all-NaN) polygons
     means = [0.0 if not np.isfinite(v) else float(v) for v in means]
@@ -63,7 +70,10 @@ def extract_features(
     poly_indexes: Optional[Sequence[int]] = None,
     progress: Optional[Progress] = None,
 ) -> Tuple[gpd.GeoDataFrame, np.ndarray]:
-    gdf = gpd.read_file(segments_path)
+    gdf = gpd.read_file(segments_path).copy()
+    gdf = gdf.reset_index(drop=True)
+    if "seg_id" not in gdf.columns:
+        gdf["seg_id"] = np.arange(1, len(gdf) + 1, dtype=np.int32)
     if poly_indexes is not None:
         gdf = gdf.iloc[list(poly_indexes)].copy().reset_index(drop=True)
 
@@ -380,6 +390,13 @@ def apply_model_with_pixel_sampling(
     if "majority" not in gdf.columns:
         gdf["majority"] = None
 
+    try:
+        cap = int(max_pixels_per_polygon)
+    except Exception:
+        cap = 200
+    if cap <= 0:
+        cap = 1
+
     start = time.time()
     with rasterio.open(raster_path) as src:
         # Reproject segments to raster CRS if needed
@@ -389,65 +406,123 @@ def apply_model_with_pixel_sampling(
         except Exception:
             pass
 
-        total = len(gdf)
-        for i, geom in enumerate(gdf.geometry):
-            try:
-                data, _ = rio_mask(src, [mapping(geom)], crop=True, filled=False)
-                if data.size == 0:
-                    continue
-                # Ensure expected bands
-                if data.shape[0] != bands:
-                    # Resize-like handling: if raster has more bands, take first 'bands'; if fewer, skip
-                    if data.shape[0] > bands:
-                        data = data[:bands]
-                    else:
-                        continue
-                if np.ma.isMaskedArray(data):
-                    arr = data
-                else:
-                    arr = np.ma.array(data, mask=False)
-                mask_bad = np.zeros(arr.shape[1:], dtype=bool)
-                for b in range(arr.shape[0]):
-                    band = np.array(arr[b], dtype=np.float32)
-                    bad = (band == 0) | (band == 65535) | ~np.isfinite(band)
-                    mask_bad |= np.array(bad)
-                mask_any = np.array(np.ma.getmaskarray(arr)).any(axis=0) | mask_bad
-                valid_idx = np.where(~mask_any)
-                n_valid = valid_idx[0].size
-                if n_valid == 0:
-                    continue
-                k = min(max(1, int(max_pixels_per_polygon)), n_valid)
-                # Choose random subset of pixel indices
-                flat_idx = np.ravel_multi_index(valid_idx, mask_any.shape)
-                rng = np.random.default_rng(42 + i)
-                pick = rng.choice(flat_idx, size=k, replace=False)
-                # Convert back to 2D indices
-                yy, xx = np.unravel_index(pick, mask_any.shape)
-                # Gather per-pixel vectors
-                pixels = np.stack([np.array(arr[b], dtype=np.float32)[yy, xx] for b in range(arr.shape[0])], axis=1)
-                # Predict per-pixel
-                y_pred = rf.predict(pixels)
-                classes = le.inverse_transform(y_pred)
-                # Compute proportions and write into row
-                vals, counts = np.unique(classes, return_counts=True)
-                props = {str(v): float(c) / float(k) for v, c in zip(vals, counts)}
-                for cls in le.classes_:
-                    gdf.at[i, cls_to_field[str(cls)]] = props.get(str(cls), 0.0)
-                gdf.at[i, "n_samp"] = int(k)
-                # Majority class
-                if counts.size:
-                    maj = str(vals[np.argmax(counts)])
-                    gdf.at[i, "majority"] = maj
-            except Exception:
-                # Skip geometry on failure
+        height, width = src.height, src.width
+        if progress:
+            progress(0, 4, "Rasterizing segments")
+        seg_id_grid = rio_features.rasterize(
+            (
+                (geom, int(seg_id))
+                for geom, seg_id in zip(gdf.geometry, gdf["seg_id"])
+                if geom is not None and not geom.is_empty
+            ),
+            out_shape=(height, width),
+            transform=src.transform,
+            fill=-1,
+            dtype="int32",
+        )
+
+        if src.count < bands:
+            raise RuntimeError(
+                f"Raster has {src.count} band(s) but model expects {bands}."
+            )
+
+        sample_store: dict[int, np.ndarray] = {}
+        sample_counts: dict[int, int] = defaultdict(int)
+        total_seen: dict[int, int] = defaultdict(int)
+        rng = np.random.default_rng(42)
+
+        if progress:
+            progress(1, 4, "Sampling pixels")
+
+        indexes = list(range(1, bands + 1))
+        for _, window in src.block_windows(1):
+            data = src.read(indexes, window=window).astype(np.float32)
+            if np.isfinite(data).any() and float(np.nanmax(data)) > 1.0:
+                data /= 65535.0
+            mask_bad = np.zeros((window.height, window.width), dtype=bool)
+            for b in range(data.shape[0]):
+                band = data[b]
+                bad = (band == 0) | (band == 65535) | ~np.isfinite(band)
+                mask_bad |= bad
+            seg_block = seg_id_grid[
+                window.row_off : window.row_off + window.height,
+                window.col_off : window.col_off + window.width,
+            ]
+            valid = (~mask_bad) & (seg_block >= 0)
+            if not valid.any():
                 continue
-            if progress and (i % 5 == 0 or i + 1 == total):
-                progress(i + 1, total, f"Classifying polygons {i+1}/{total}")
+            seg_vals = np.unique(seg_block[valid])
+            for seg_val in seg_vals:
+                mask_seg = valid & (seg_block == seg_val)
+                pix = data[:, mask_seg].reshape(data.shape[0], -1).T
+                if pix.size == 0:
+                    continue
+                store = sample_store.get(int(seg_val))
+                if store is None:
+                    store = np.zeros((cap, bands), dtype=np.float32)
+                    sample_store[int(seg_val)] = store
+                for row in pix:
+                    total_seen[int(seg_val)] += 1
+                    ts = total_seen[int(seg_val)]
+                    if sample_counts[int(seg_val)] < cap:
+                        store[sample_counts[int(seg_val)]] = row
+                        sample_counts[int(seg_val)] += 1
+                    else:
+                        j = rng.integers(0, ts)
+                        if j < cap:
+                            store[j] = row
+
+        sample_pixels: List[np.ndarray] = []
+        sample_seg_ids: List[np.ndarray] = []
+        for seg_id, store in sample_store.items():
+            count = sample_counts.get(seg_id, 0)
+            if count <= 0:
+                continue
+            sample_pixels.append(store[:count])
+            sample_seg_ids.append(np.full(count, int(seg_id), dtype=np.int32))
+
+        if sample_pixels:
+            if progress:
+                progress(2, 4, "Classifying samples")
+            X = np.vstack(sample_pixels)
+            seg_sample_ids = np.concatenate(sample_seg_ids)
+            y_pred = rf.predict(X)
+            classes = le.inverse_transform(y_pred)
+
+            counts_by_seg: dict[int, Counter] = defaultdict(Counter)
+            for seg_id, cls in zip(seg_sample_ids, classes):
+                counts_by_seg[int(seg_id)][str(cls)] += 1
+
+            if progress:
+                progress(3, 4, "Aggregating results")
+
+            seg_id_to_idx = {int(seg_id): idx for idx, seg_id in enumerate(gdf["seg_id"])}
+            for seg_id, counter in counts_by_seg.items():
+                total = sum(counter.values())
+                if total <= 0:
+                    continue
+                row_idx = seg_id_to_idx.get(int(seg_id))
+                if row_idx is None:
+                    continue
+                gdf.at[row_idx, "n_samp"] = int(total)
+                for cls in le.classes_:
+                    fld = cls_to_field[str(cls)]
+                    gdf.at[row_idx, fld] = float(counter.get(str(cls), 0)) / float(total)
+                maj = max(counter.items(), key=lambda kv: kv[1])[0]
+                gdf.at[row_idx, "majority"] = str(maj)
 
     base_out = Path(output_root)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     folder = base_out / "Output" / f"2-RF/Run_{ts}" if base_out.name.lower() != "output" else base_out / f"2-RF/Run_{ts}"
     folder.mkdir(parents=True, exist_ok=True)
+    keep_cols = []
+    if "seg_id" in gdf.columns:
+        keep_cols.append("seg_id")
+    keep_cols.extend([c for c in cls_to_field.values()])
+    keep_cols.append("majority")
+    keep_cols = [c for c in keep_cols if c in gdf.columns]
+    keep_cols.append("geometry")
+    gdf = gdf[keep_cols]
     out_path = folder / f"Classification_{ts}.shp"
     gdf.to_file(out_path)
     return ApplyResult(output_path=out_path, duration_sec=time.time() - start)
