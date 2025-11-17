@@ -6,6 +6,7 @@ import time
 import threading
 import subprocess
 from typing import List
+import webbrowser
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -23,17 +24,21 @@ from .classification import (
     apply_model_with_pixel_sampling,
 )
 from .predetection import detect_cultivation_plots, save_preselection_to_output
+from .map_preview import build_classification_map
 import geopandas as gpd
-
-
- 
-
-
 class ImageSelectorApp(ttk.Frame):
     def __init__(self, master: tk.Tk):
         super().__init__(master, padding=12)
-        self.master.title("Madakappy – Segmentation & Classification")
+        self.master.title("Madakappy - Segmentation & Classification")
         self.master.minsize(980, 640)
+        self._app_icon = None
+        try:
+            icon_path = Path(__file__).resolve().parent.parent / "icon" / "madakappy.png"
+            if icon_path.exists():
+                self._app_icon = tk.PhotoImage(file=str(icon_path))
+                self.master.iconphoto(True, self._app_icon)
+        except Exception:
+            self._app_icon = None
 
         # Core state
         self.images: List[str] = []
@@ -43,6 +48,7 @@ class ImageSelectorApp(ttk.Frame):
         self._model_path: str | None = None
         self._last_aoi_path: str | None = None
         self._cm_photo = None
+        self._controls_state = "normal"
 
         # Segmentation parameters
         self.var_in_raster = tk.StringVar(value=str(Path("Data") / "All_cropped.tif"))
@@ -54,6 +60,7 @@ class ImageSelectorApp(ttk.Frame):
 
         # Classification parameters
         self.var_model_path = tk.StringVar()
+        self.var_classifier_mode = tk.StringVar(value="rf")
         self.var_train_raster = tk.StringVar(value=self.var_in_raster.get())
         self.var_train_path = tk.StringVar()
         self.var_class_col = tk.StringVar()
@@ -67,6 +74,9 @@ class ImageSelectorApp(ttk.Frame):
         self.var_pre_lmax = tk.StringVar(value="60")
         self.var_pre_small_buffer = tk.StringVar(value="0.3")
         self.var_pre_quantile = tk.DoubleVar(value=0.15)
+        self._pre_controls: list[tk.Widget] = []
+        self._rf_controls: list[tk.Widget] = []
+        self._model_hint_text = ""
 
         self._build()
 
@@ -147,6 +157,7 @@ class ImageSelectorApp(ttk.Frame):
         ttk.Label(io, text="Custom AOI (.shp, optional)").grid(row=2, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(io, textvariable=self.var_custom_aoi, width=56).grid(row=2, column=1, sticky="we", padx=6, pady=6)
         ttk.Button(io, text="Browse", command=self._on_pick_custom_aoi).grid(row=2, column=2, padx=6, pady=6)
+        self.var_custom_aoi.trace_add("write", lambda *_: self._update_custom_aoi_state())
 
         try:
             default_out = str((Path.cwd() / "Output").resolve())
@@ -165,17 +176,27 @@ class ImageSelectorApp(ttk.Frame):
             row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(6, 4)
         )
         ttk.Label(pre, text="Min width (m)").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(pre, textvariable=self.var_pre_wmin, width=10).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        entry = ttk.Entry(pre, textvariable=self.var_pre_wmin, width=10)
+        entry.grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        self._pre_controls.append(entry)
         ttk.Label(pre, text="Max width (m)").grid(row=1, column=2, sticky="w", padx=8, pady=4)
-        ttk.Entry(pre, textvariable=self.var_pre_wmax, width=10).grid(row=1, column=3, sticky="w", padx=6, pady=4)
+        entry = ttk.Entry(pre, textvariable=self.var_pre_wmax, width=10)
+        entry.grid(row=1, column=3, sticky="w", padx=6, pady=4)
+        self._pre_controls.append(entry)
 
         ttk.Label(pre, text="Min length (m)").grid(row=2, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(pre, textvariable=self.var_pre_lmin, width=10).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        entry = ttk.Entry(pre, textvariable=self.var_pre_lmin, width=10)
+        entry.grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        self._pre_controls.append(entry)
         ttk.Label(pre, text="Max length (m)").grid(row=2, column=2, sticky="w", padx=8, pady=4)
-        ttk.Entry(pre, textvariable=self.var_pre_lmax, width=10).grid(row=2, column=3, sticky="w", padx=6, pady=4)
+        entry = ttk.Entry(pre, textvariable=self.var_pre_lmax, width=10)
+        entry.grid(row=2, column=3, sticky="w", padx=6, pady=4)
+        self._pre_controls.append(entry)
 
         ttk.Label(pre, text="Small-plot buffer (m)").grid(row=3, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(pre, textvariable=self.var_pre_small_buffer, width=10).grid(row=3, column=1, sticky="w", padx=6, pady=4)
+        entry = ttk.Entry(pre, textvariable=self.var_pre_small_buffer, width=10)
+        entry.grid(row=3, column=1, sticky="w", padx=6, pady=4)
+        self._pre_controls.append(entry)
         ttk.Label(pre, text="Blue quantile").grid(row=4, column=0, sticky="w", padx=8, pady=4)
         quant_frame = ttk.Frame(pre)
         quant_frame.grid(row=4, column=1, columnspan=3, sticky="we", padx=6, pady=4)
@@ -190,6 +211,7 @@ class ImageSelectorApp(ttk.Frame):
             command=lambda v: self.lbl_quantile_val.configure(text=f"{float(v):.2f}"),
         )
         scale.grid(row=0, column=0, sticky="we", padx=(0, 8))
+        self._pre_controls.append(scale)
         self.lbl_quantile_val.grid(row=0, column=1, sticky="e")
 
         # Segmentation params
@@ -215,17 +237,46 @@ class ImageSelectorApp(ttk.Frame):
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         right.columnconfigure(0, weight=1)
 
-        clf = ttk.LabelFrame(right, text="Model Selection", style="SectionAlt.TLabelframe")
+        clf = ttk.LabelFrame(right, text="Classification", style="SectionAlt.TLabelframe")
         clf.grid(row=0, column=0, sticky="we")
         clf.columnconfigure(1, weight=1)
-        ttk.Label(clf, text="Model (.joblib)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(clf, textvariable=self.var_model_path).grid(row=0, column=1, sticky="we", padx=6, pady=4)
-        ttk.Button(clf, text="Browse…", command=self._on_browse_model).grid(row=0, column=2, padx=6, pady=4)
-        ttk.Button(
+        ttk.Label(clf, text="Classification method").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        mode_frame = ttk.Frame(clf)
+        mode_frame.grid(row=0, column=1, columnspan=2, sticky="w", padx=6, pady=4)
+        ttk.Radiobutton(
+            mode_frame,
+            text="Random Forest model",
+            value="rf",
+            variable=self.var_classifier_mode,
+            command=self._update_classifier_mode_state,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Simple statistics (dark rows)",
+            value="stats",
+            variable=self.var_classifier_mode,
+            command=self._update_classifier_mode_state,
+        ).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(clf, text="Model (.joblib)").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.model_entry = ttk.Entry(clf, textvariable=self.var_model_path)
+        self.model_entry.grid(row=1, column=1, sticky="we", padx=6, pady=4)
+        self._rf_controls.append(self.model_entry)
+        browse_btn = ttk.Button(clf, text="Browse…", command=self._on_browse_model)
+        browse_btn.grid(row=1, column=2, padx=6, pady=4)
+        self._rf_controls.append(browse_btn)
+        self.btn_open_train = ttk.Button(
             clf,
             text="Need a model? Open training tab →",
             command=lambda: self.notebook.select(self.train_tab),
-        ).grid(row=1, column=0, columnspan=3, sticky="we", padx=6, pady=(2, 4))
+        )
+        self.btn_open_train.grid(row=2, column=0, columnspan=3, sticky="we", padx=6, pady=(2, 4))
+        self._rf_controls.append(self.btn_open_train)
+        self.model_hint_label = ttk.Label(clf, text="", foreground="#666")
+        self.model_hint_label.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
+        self._model_hint_text = "Select a trained .joblib model before running Random Forest classification."
+        self.model_hint_label.configure(text=self._model_hint_text)
+        self.var_classifier_mode.trace_add("write", lambda *_: self._update_classifier_mode_state())
 
         # Confusion matrix preview
         self.cm_label = ttk.Label(right, style="ContentAlt.TLabel")
@@ -236,7 +287,9 @@ class ImageSelectorApp(ttk.Frame):
         applyf.grid(row=2, column=0, sticky="we", pady=(8, 0))
         applyf.columnconfigure(1, weight=1)
         ttk.Label(applyf, text="Max pixels per polygon (apply)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(applyf, textvariable=self.var_max_pixels_per_polygon, width=12).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        self.max_pixels_entry = ttk.Entry(applyf, textvariable=self.var_max_pixels_per_polygon, width=12)
+        self.max_pixels_entry.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        self._rf_controls.append(self.max_pixels_entry)
         # Apply happens as part of full workflow
 
         # Footer / status
@@ -295,6 +348,9 @@ class ImageSelectorApp(ttk.Frame):
             row=2, column=0, sticky="w", pady=(12, 0)
         )
 
+        self._update_custom_aoi_state()
+        self._update_classifier_mode_state()
+
         # Shortcuts
         try:
             self.master.bind('<F5>', lambda e: self._on_run_workflow())
@@ -304,6 +360,7 @@ class ImageSelectorApp(ttk.Frame):
 
     # ─────────── UI helpers ───────────
     def _set_controls_state(self, state: str) -> None:
+        self._controls_state = state
         for child in self.winfo_children():
             try:
                 child.configure(state=state)
@@ -313,6 +370,43 @@ class ImageSelectorApp(ttk.Frame):
             self.run_btn.configure(state=state)
         except Exception:
             pass
+        if state == "normal":
+            self._update_custom_aoi_state()
+            self._update_classifier_mode_state()
+
+    def _update_custom_aoi_state(self, *_):
+        if self._controls_state != "normal":
+            return
+        has_custom = bool((self.var_custom_aoi.get() or "").strip())
+        state = "disabled" if has_custom else "normal"
+        for widget in self._pre_controls:
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
+        pre_btn = getattr(self, "pre_btn", None)
+        if pre_btn:
+            try:
+                pre_btn.configure(state=state)
+            except Exception:
+                pass
+
+    def _update_classifier_mode_state(self, *_):
+        if self._controls_state != "normal":
+            return
+        mode = (self.var_classifier_mode.get() or "rf").lower()
+        use_rf = mode == "rf"
+        state = "normal" if use_rf else "disabled"
+        for widget in self._rf_controls:
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
+        hint = self._model_hint_text or ""
+        if not use_rf:
+            hint = "Random Forest controls disabled while using the statistics-based classifier."
+        if hasattr(self, "model_hint_label"):
+            self.model_hint_label.configure(text=hint)
 
     def _update_progress(self, done: int, total: int, start_time: float, note: str = "") -> None:
         self.progress.configure(maximum=max(1, total), value=done)
@@ -382,6 +476,15 @@ class ImageSelectorApp(ttk.Frame):
             self.var_otb_bin.set(path)
             self._set_status("OTB path set")
 
+    def _display_classification_preview(self, html_path: Path | str) -> None:
+        try:
+            target = Path(html_path).resolve()
+            url = "file:///" + str(target).replace("\\", "/")
+            webbrowser.open(url)
+            self._toast("Opened classification preview map.", kind="info")
+        except Exception:
+            self._toast("Could not open classification preview map.", kind="warning")
+
     # ─────────── Segmentation ───────────
     def _on_run_workflow(self) -> None:
         in_raster = self.var_in_raster.get()
@@ -406,6 +509,8 @@ class ImageSelectorApp(ttk.Frame):
             self._invalidate_field(None, msg="Invalid OTB path")
             self._toast("Set a valid OTB LargeScaleMeanShift path", kind="error")
             return
+        classifier_mode = (self.var_classifier_mode.get() or "rf").lower()
+        initial_model_path = (self.var_model_path.get() or "").strip()
 
         session = Session(
             images=self.images,
@@ -427,6 +532,8 @@ class ImageSelectorApp(ttk.Frame):
             from .segmentation import run_segmentation
             start0 = time.time()
             custom_path = custom_aoi
+            mode = classifier_mode
+            model_path_value = initial_model_path
 
             def make_cb(step: str):
                 def cb(done: int, total: int, note: str = ""):
@@ -491,15 +598,33 @@ class ImageSelectorApp(ttk.Frame):
                         if seg_gdf.crs and aoi_gdf.crs and str(seg_gdf.crs) != str(aoi_gdf.crs):
                             aoi_gdf = aoi_gdf.to_crs(seg_gdf.crs)
                         filt = gpd.sjoin(seg_gdf, aoi_gdf, predicate="intersects", how="inner")
+                        plot_lookup = {idx: geom for idx, geom in zip(aoi_gdf.index, aoi_gdf.geometry)}
+                        def _compute_plot_area(row):
+                            pid = row.get("index_right")
+                            geom = row.geometry
+                            target = plot_lookup.get(pid)
+                            if target is None:
+                                return float(geom.area)
+                            try:
+                                return float(geom.intersection(target).area)
+                            except Exception:
+                                return float(geom.area)
+                        filt["plot_area"] = filt.apply(_compute_plot_area, axis=1)
                         if "index_right" in filt.columns:
-                            filt = filt.drop(columns=["index_right"])
-                        # Drop duplicates that may arise from overlapping AOIs
+                            filt = filt.rename(columns={"index_right": "plot_id"})
+                        elif "plot_id" not in filt.columns:
+                            filt["plot_id"] = -1
                         filt = filt.loc[~filt.geometry.is_empty].copy()
                         filt = filt.reset_index(drop=True)
                         out_aoi_seg = seg_res.out_dir / f"{seg_res.out_shp.stem}_AOI.shp"
                         filt.to_file(out_aoi_seg)
                         self._last_seg_path = str(out_aoi_seg)
                     else:
+                        if "plot_id" not in seg_gdf.columns:
+                            seg_gdf["plot_id"] = 0
+                        if "plot_area" not in seg_gdf.columns:
+                            seg_gdf["plot_area"] = seg_gdf.geometry.area
+                        seg_gdf.to_file(seg_res.out_shp)
                         self._last_seg_path = str(seg_res.out_shp)
                 except Exception:
                     # If filtering fails, fall back to full segmentation
@@ -510,41 +635,74 @@ class ImageSelectorApp(ttk.Frame):
 
             self.after(0, lambda: self._update_stepper(1))
 
-            # Step 2: get model (selection only)
-            model_path: str | None = self.var_model_path.get() or self._model_path
-            if not model_path or not os.path.exists(model_path):
-                # Prompt once
-                def pick_model():
-                    return filedialog.askopenfilename(
-                        title="Select model file",
-                        filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")],
-                    )
-                model_path = self._blocking_dialog(pick_model)
-            if not model_path:
-                self.after(0, lambda: self._on_workflow_failed("No model selected."))
-                return
-            self._model_path = model_path
-            self.var_model_path.set(model_path)
-            self.after(0, lambda: self._load_cm_preview_for_model(model_path))
+            # Step 2: classifier configuration
+            model_to_use: str | None = None
+            if mode == "rf":
+                model_to_use = model_path_value or self._model_path
+                if not model_to_use or not os.path.exists(model_to_use):
+                    # Prompt once
+                    def pick_model():
+                        return filedialog.askopenfilename(
+                            title="Select model file",
+                            filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")],
+                        )
+
+                    model_to_use = self._blocking_dialog(pick_model)
+                if not model_to_use:
+                    self.after(0, lambda: self._on_workflow_failed("No model selected."))
+                    return
+                self._model_path = model_to_use
+                model_path_value = model_to_use
+                self.var_model_path.set(model_to_use)
+                self.after(0, lambda: self._load_cm_preview_for_model(model_to_use))
             self.after(0, lambda: self._update_stepper(2))
 
             # Step 3: apply
             try:
-                cap_pol = 0
-                try:
-                    cap_pol = int(self.var_max_pixels_per_polygon.get() or 0)
-                except Exception:
+                if mode == "rf":
                     cap_pol = 0
-                cap_pol = max(1, cap_pol) if cap_pol else 200
-                apply_res = apply_model_with_pixel_sampling(
-                    session.seg_in_raster,
-                    self._last_seg_path,
-                    model_path,
-                    session.output_dir,
-                    max_pixels_per_polygon=cap_pol,
-                    progress=make_cb("Classifying"),
-                )
-                self.after(0, lambda: self._on_workflow_done(apply_res.output_path))
+                    try:
+                        cap_pol = int(self.var_max_pixels_per_polygon.get() or 0)
+                    except Exception:
+                        cap_pol = 0
+                    cap_pol = max(1, cap_pol) if cap_pol else 200
+                    apply_res = apply_model_with_pixel_sampling(
+                        session.seg_in_raster,
+                        self._last_seg_path,
+                        model_to_use,
+                        session.output_dir,
+                        max_pixels_per_polygon=cap_pol,
+                        progress=make_cb("Classifying"),
+                    )
+                    try:
+                        preview_path = build_classification_map(
+                            apply_res.output_path, session.seg_in_raster, mode="rf"
+                        )
+                    except Exception:
+                        preview_path = None
+                    if preview_path:
+                        self.after(0, lambda p=preview_path: self._display_classification_preview(p))
+                    self.after(0, lambda: self._on_workflow_done(apply_res.output_path))
+                else:
+                    from .simple_classifier import classify_dark_linear_polygons
+
+                    stats_res = classify_dark_linear_polygons(
+                        session.seg_in_raster,
+                        self._last_seg_path,
+                        session.output_dir,
+                        progress=make_cb("Statistics"),
+                    )
+                    summary = f"Statistics classifier: {stats_res.selected_count} polygons selected by spectral rules."
+                    self.after(0, lambda: self._set_status(summary))
+                    try:
+                        preview_path = build_classification_map(
+                            stats_res.output_path, session.seg_in_raster, mode="stats"
+                        )
+                    except Exception:
+                        preview_path = None
+                    if preview_path:
+                        self.after(0, lambda p=preview_path: self._display_classification_preview(p))
+                    self.after(0, lambda: self._on_workflow_done(str(stats_res.output_path)))
             except Exception as e:
                 self.after(0, lambda: self._on_workflow_failed(f"Classification failed: {e}"))
 

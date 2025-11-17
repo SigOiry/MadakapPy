@@ -23,6 +23,8 @@ def run_flet_app() -> None:
         train_model_from_training_polys,
         apply_model_with_pixel_sampling,
     )
+    from .simple_classifier import classify_dark_linear_polygons
+    from .map_preview import build_classification_map
     import numpy as np
     import pandas as pd
     import geopandas as gpd
@@ -403,6 +405,12 @@ def run_flet_app() -> None:
             page.theme = ft.Theme(color_scheme_seed=pal["primary"])  # type: ignore
         except Exception:
             pass
+        try:
+            icon_file = Path("icon") / "madakappy.png"
+            if icon_file.exists():
+                page.window_icon_path = str(icon_file.resolve())
+        except Exception:
+            pass
         page.window_maximized = True
         page.padding = 16
         page.bgcolor = pal["surface"]
@@ -426,6 +434,9 @@ def run_flet_app() -> None:
         pre_small_buffer = ft.TextField(value="0.3", width=140, text_align=ft.TextAlign.RIGHT, hint_text="Buffer (m)")
         pre_quantile = ft.Slider(min=0.05, max=0.9, value=0.15, divisions=17, expand=True)
         pre_quantile_label = ft.Text("", color=pal["muted"])
+        pre_disabled_hint = ft.Text("", size=12, color=pal["muted"])
+        pre_inputs: list[ft.Control] = [pre_wmin, pre_wmax, pre_lmin, pre_lmax, pre_small_buffer, pre_quantile]
+        pre_button_ref: dict[str, Optional[ft.ElevatedButton]] = {"btn": None}
 
         def _update_quant_label(val: float | None) -> None:
             pre_quantile_label.value = f"Blue quantile: {val:.2f}" if val is not None else "Blue quantile: --"
@@ -445,6 +456,29 @@ def run_flet_app() -> None:
             _update_quant_label(v)
 
         pre_quantile.on_change = _on_quantile_change
+
+        def _safe_update(ctrl: ft.Control) -> None:
+            try:
+                if ctrl.page:
+                    ctrl.update()
+            except Exception:
+                pass
+
+        def sync_preselection_state() -> None:
+            disabled = bool((custom_aoi.value or "").strip())
+            for ctrl in pre_inputs:
+                ctrl.disabled = disabled
+                _safe_update(ctrl)
+            pre_disabled_hint.value = (
+                "Preselection parameters are disabled while a custom AOI is set." if disabled else ""
+            )
+            _safe_update(pre_disabled_hint)
+            btn = pre_button_ref["btn"]
+            if btn is not None:
+                btn.disabled = disabled
+                _safe_update(btn)
+
+        custom_aoi.on_change = lambda e: sync_preselection_state()
 
         # Status
         step_text = ft.Text("Ready", size=12, color=pal["muted"]) 
@@ -491,6 +525,26 @@ def run_flet_app() -> None:
                             content=ft.Text(f"Opened map in your browser.\n{pth}"),
                             actions=[
                                 ft.TextButton("Open Again", on_click=_open_again),
+                                ft.TextButton("Close", on_click=lambda e: (setattr(dlg, "open", False), page.update())),
+                            ],
+                        )
+                        page.dialog = dlg
+                        dlg.open = True
+                elif kind == "classification_preview":
+                    pth = msg.get("path")
+                    if pth:
+                        def _open_preview(_=None):
+                            try:
+                                page.launch_url("file:///" + str(Path(pth).resolve()).replace("\\", "/"))
+                            except Exception:
+                                pass
+                        _open_preview()
+                        dlg = ft.AlertDialog(
+                            modal=True,
+                            title=ft.Text("Classification preview"),
+                            content=ft.Text(f"Opened map in your browser.\n{pth}"),
+                            actions=[
+                                ft.TextButton("Open Again", on_click=lambda e: _open_preview()),
                                 ft.TextButton("Close", on_click=lambda e: (setattr(dlg, "open", False), page.update())),
                             ],
                         )
@@ -561,6 +615,7 @@ def run_flet_app() -> None:
                 if e.files:
                     custom_aoi.value = e.files[0].path
                     custom_aoi.update()
+                    sync_preselection_state()
             except Exception:
                 pass
         def on_pick_train_image(e: ft.FilePickerResultEvent):
@@ -637,7 +692,8 @@ def run_flet_app() -> None:
             page.update()
             if not in_raster.value.strip() or not output_dir.value.strip() or not os.path.exists(otb_bin.value.strip()):
                 step_text.value = "Set input raster, output directory and a valid OTB path"; page.update(); return
-            if not (model_path.value or "").strip():
+            mode_sel = (classifier_mode.value or "rf")
+            if mode_sel == "rf" and not (model_path.value or "").strip():
                 step_text.value = "Select a model before running the workflow"
                 page.update()
                 return
@@ -648,6 +704,7 @@ def run_flet_app() -> None:
                 step_text.value = "Custom AOI must be a .shp file"; page.update(); return
             def worker():
                 try:
+                    mode_local = mode_sel
                     # Preselection first
                     custom_path_local = custom_path
                     if custom_path_local:
@@ -709,15 +766,17 @@ def run_flet_app() -> None:
                     mins = _safe_int(minsize, 5)
 
                     # Classification settings
-                    cap_pol = 0
-                    try:
-                        cap_pol = int(max_pixels_per_polygon.value or "0")
-                    except Exception:
-                        cap_pol = 0
-                    cap_pol = max(1, cap_pol) if cap_pol else 200
-                    model_file = (model_path.value or "").strip()
-                    if not model_file or not os.path.exists(model_file):
-                        raise RuntimeError("Selected model file does not exist")
+                    cap_pol = 200
+                    model_file = None
+                    if mode_local == "rf":
+                        try:
+                            cap_pol = int(max_pixels_per_polygon.value or "0")
+                        except Exception:
+                            cap_pol = 0
+                        cap_pol = max(1, cap_pol) if cap_pol else 200
+                        model_file = (model_path.value or "").strip()
+                        if not model_file or not os.path.exists(model_file):
+                            raise RuntimeError("Selected model file does not exist")
 
                     # Prepare AOI list
                     if not aoi_final or not os.path.exists(aoi_final):
@@ -773,6 +832,22 @@ def run_flet_app() -> None:
                                 if drop_cols:
                                     seg_gdf = seg_gdf.drop(columns=drop_cols, errors="ignore")
                                 seg_gdf["seg_id"] = np.arange(seg_counter, seg_counter + seg_len, dtype=np.int64)
+                                seg_gdf["plot_id"] = int(idx)
+                                try:
+                                    target_geom = (
+                                        single.to_crs(seg_gdf.crs).geometry.iloc[0]
+                                        if seg_gdf.crs and single.crs and str(seg_gdf.crs) != str(single.crs)
+                                        else single.geometry.iloc[0]
+                                    )
+                                except Exception:
+                                    target_geom = None
+                                if target_geom is not None:
+                                    try:
+                                        seg_gdf["plot_area"] = seg_gdf.geometry.intersection(target_geom).area
+                                    except Exception:
+                                        seg_gdf["plot_area"] = seg_gdf.geometry.area
+                                else:
+                                    seg_gdf["plot_area"] = seg_gdf.geometry.area
                                 seg_counter += seg_len
                                 seg_frames.append(seg_gdf)
                         except Exception as seg_err:
@@ -796,26 +871,66 @@ def run_flet_app() -> None:
                     page.pubsub.send_all({"kind": "result", "text": "Segments merged. Running classification..."})
 
                     try:
-                        cls_res = apply_model_with_pixel_sampling(
-                            in_raster.value.strip(),
-                            str(combined_path),
-                            model_file,
-                            output_dir.value.strip(),
-                            max_pixels_per_polygon=cap_pol,
-                            progress=lambda d, t, n: page.pubsub.send_all(
+                        if mode_local == "rf":
+                            cls_res = apply_model_with_pixel_sampling(
+                                in_raster.value.strip(),
+                                str(combined_path),
+                                model_file,
+                                output_dir.value.strip(),
+                                max_pixels_per_polygon=cap_pol,
+                                progress=lambda d, t, n: page.pubsub.send_all(
+                                    {
+                                        "kind": "progress",
+                                        "text": "Classifying",
+                                        "ratio": (0 if t == 0 else d / max(1, t)),
+                                    }
+                                ),
+                            )
+                            page.pubsub.send_all(
                                 {
-                                    "kind": "progress",
-                                    "text": "Classifying",
-                                    "ratio": (0 if t == 0 else d / max(1, t)),
+                                    "kind": "result",
+                                    "text": f"Workflow complete. Classification saved to:\n{cls_res.output_path}",
                                 }
-                            ),
-                        )
-                        page.pubsub.send_all(
-                            {
-                                "kind": "result",
-                                "text": f"Workflow complete. Classification saved to:\n{cls_res.output_path}",
-                            }
-                        )
+                            )
+                            try:
+                                preview_path = build_classification_map(
+                                    cls_res.output_path, in_raster.value.strip(), mode="rf"
+                                )
+                            except Exception:
+                                preview_path = None
+                            if preview_path:
+                                page.pubsub.send_all({"kind": "classification_preview", "path": str(preview_path)})
+                        else:
+                            stats_res = classify_dark_linear_polygons(
+                                in_raster.value.strip(),
+                                str(combined_path),
+                                output_dir.value.strip(),
+                                progress=lambda d, t, n: page.pubsub.send_all(
+                                    {
+                                        "kind": "progress",
+                                        "text": n or "Statistics classifier",
+                                        "ratio": (0 if t == 0 else d / max(1, t)),
+                                    }
+                                ),
+                            )
+                            page.pubsub.send_all(
+                                {
+                                    "kind": "result",
+                                    "text": (
+                                        "Workflow complete (statistics classifier).\n"
+                                        f"Selected {stats_res.selected_count} polygons via spectral rules.\n"
+                                        f"Saved to:\n{stats_res.output_path}"
+                                    ),
+                                }
+                            )
+                            try:
+                                preview_path = build_classification_map(
+                                    stats_res.output_path, in_raster.value.strip(), mode="stats"
+                                )
+                            except Exception:
+                                preview_path = None
+                            if preview_path:
+                                page.pubsub.send_all({"kind": "classification_preview", "path": str(preview_path)})
                         _cleanup_root_tiffs()
                         page.pubsub.send_all({"kind": "workflow_done", "text": "Workflow complete."})
                     finally:
@@ -890,6 +1005,7 @@ def run_flet_app() -> None:
                 ),
                 padding=ft.padding.symmetric(horizontal=4),
             ),
+            pre_disabled_hint,
             subtitle="Tune AOI detection and run.",
             bgcolor="#EAF7F5",
         )
@@ -920,6 +1036,35 @@ def run_flet_app() -> None:
         class_column = ft.Dropdown(options=[], expand=True)
         max_pixels_per_class = ft.TextField(value="0", width=120, hint_text="0 = no cap")
         train_info = ft.Text("", size=12, color=pal["muted"])
+        classifier_mode = ft.RadioGroup(
+            value="rf",
+            content=ft.Row(
+                [
+                    ft.Radio(value="rf", label="Random Forest model"),
+                    ft.Radio(value="stats", label="Statistics (dark rows)"),
+                ],
+                wrap=True,
+            ),
+        )
+        rf_controls: list[ft.Control] = []
+        model_hint_state = {"text": "Select a trained model from the 'Model' directory."}
+        model_hint.value = model_hint_state["text"]
+
+        def update_model_hint() -> None:
+            if (classifier_mode.value or "rf") == "stats":
+                model_hint.value = "Statistics mode enabled – Random Forest controls are disabled."
+            else:
+                model_hint.value = model_hint_state["text"]
+            _safe_update(model_hint)
+
+        def sync_classifier_mode() -> None:
+            use_rf = (classifier_mode.value or "rf") == "rf"
+            for ctrl in rf_controls:
+                ctrl.disabled = not use_rf
+                _safe_update(ctrl)
+            update_model_hint()
+
+        classifier_mode.on_change = lambda e: sync_classifier_mode()
 
         def switch_to_training_tab(_=None):
             tabs = tabs_ref.current
@@ -959,8 +1104,8 @@ def run_flet_app() -> None:
                 note = f"Failed to read '{root}': {exc}"
             model_path.options = options
             model_path.update()
-            model_hint.value = note
-            model_hint.update()
+            model_hint_state["text"] = note
+            update_model_hint()
 
         def load_fields(_):
             try:
@@ -977,14 +1122,24 @@ def run_flet_app() -> None:
                 train_info.value = "Could not read fields."
                 page.update()
 
+        refresh_btn = ft.IconButton(icon=ft.icons.REFRESH, tooltip="Rescan Model directory", on_click=refresh_model_list)
+        rf_controls.extend([model_path, refresh_btn, max_pixels_per_polygon])
+        train_tab_btn = ft.TextButton("Need to train a model? Open the Train Model tab →", on_click=switch_to_training_tab)
+        rf_controls.append(train_tab_btn)
         clf = section(
-            "Model Selection",
+            "Classification",
+            labeled_row(
+                "Method",
+                classifier_mode,
+                icon=ft.icons.TUNE,
+                tip="Pick Random Forest (requires a trained model) or the statistics-based classifier.",
+            ),
             labeled_row(
                 "Model (.joblib)",
                 ft.Row(
                     [
                         model_path,
-                        ft.IconButton(icon=ft.icons.REFRESH, tooltip="Rescan Model directory", on_click=refresh_model_list),
+                        refresh_btn,
                     ],
                     spacing=8,
                     expand=True,
@@ -999,11 +1154,10 @@ def run_flet_app() -> None:
                 icon=ft.icons.SPEED,
                 tip="Number of pixels sampled in each polygon when applying the model.",
             ),
-            ft.TextButton("Need to train a model? Open the Train Model tab →", on_click=switch_to_training_tab),
-            subtitle="Pick an existing Random Forest model to classify new imagery.",
+            train_tab_btn,
+            subtitle="Choose between a trained Random Forest and the simple statistics classifier.",
             bgcolor="#FFF4EA",
         )
-
         def on_train_model(_):
             switch_to_training_tab()
             img = (train_image.value or "").strip() or (in_raster.value or "").strip()
@@ -1147,7 +1301,9 @@ def run_flet_app() -> None:
 
         # Footer / actions
         pre_btn = ft.ElevatedButton("Run Preselection", icon=ft.icons.SEARCH, on_click=lambda _: run_preselection_only())
+        pre_button_ref["btn"] = pre_btn
         run_btn = ft.ElevatedButton("Run Workflow", icon=ft.icons.PLAY_ARROW, on_click=run_workflow)
+        sync_preselection_state()
 
         # Two-column responsive layout: each section ~half width
         left_col = ft.Column([left, pre], expand=1, spacing=12)
@@ -1215,6 +1371,7 @@ def run_flet_app() -> None:
             )
         )
 
+        sync_classifier_mode()
         refresh_model_list()
 
     import flet as ft  # type: ignore
