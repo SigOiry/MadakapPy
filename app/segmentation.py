@@ -52,7 +52,7 @@ def _ranger_from_band1(src: rasterio.io.DatasetReader, window: rasterio.windows.
     band1 = src.read(1, window=window, masked=True)
     arr = band1.astype("float32")
     arr[(arr == 0) | (arr == 65535)] = np.nan
-    ranger = float(np.nanstd(arr)) / 2.0
+    ranger = float(np.nanstd(arr))
     if not np.isfinite(ranger) or ranger == 0:
         ranger = 1.0
     return ranger
@@ -85,7 +85,7 @@ def run_segmentation(
     Mimic the R 'Segmentation' chunk using OTB LargeScaleMeanShift.
 
     - Tiles the raster by physical size (m) converted to pixels via geotransform
-    - Computes ranger per tile: sd(band1)/2 (ignoring 0 and 65535)
+    - Computes ranger per tile: sd(band1) (ignoring 0 and 65535)
     - Optionally skips tiles that do not intersect `aoi_path` polygons
     - Calls OTB LargeScaleMeanShift per tile to produce BOTH raster and vector outputs
       (runs raster mode, then vector mode)

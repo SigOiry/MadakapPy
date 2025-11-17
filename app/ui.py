@@ -46,6 +46,7 @@ class ImageSelectorApp(ttk.Frame):
 
         # Segmentation parameters
         self.var_in_raster = tk.StringVar(value=str(Path("Data") / "All_cropped.tif"))
+        self.var_custom_aoi = tk.StringVar()
         self.var_tile_size = tk.IntVar(value=40)
         self.var_spatialr = tk.IntVar(value=5)
         self.var_minsize = tk.IntVar(value=5)
@@ -143,6 +144,9 @@ class ImageSelectorApp(ttk.Frame):
         self.out_entry = ttk.Entry(io)
         self.out_entry.grid(row=1, column=1, sticky="we", padx=6, pady=6)
         ttk.Button(io, text="📂 Select", command=self._on_pick_output).grid(row=1, column=2, padx=6, pady=6)
+        ttk.Label(io, text="Custom AOI (.shp, optional)").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(io, textvariable=self.var_custom_aoi, width=56).grid(row=2, column=1, sticky="we", padx=6, pady=6)
+        ttk.Button(io, text="Browse", command=self._on_pick_custom_aoi).grid(row=2, column=2, padx=6, pady=6)
 
         try:
             default_out = str((Path.cwd() / "Output").resolve())
@@ -357,6 +361,18 @@ class ImageSelectorApp(ttk.Frame):
             self.out_entry.insert(0, path)
             self._set_status("Output directory set")
 
+    def _on_pick_custom_aoi(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select AOI shapefile",
+            filetypes=[
+                ("Shapefile", "*.shp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self.var_custom_aoi.set(path)
+            self._set_status("Custom AOI shapefile set")
+
     def _on_pick_otb(self) -> None:
         path = filedialog.askopenfilename(title="Select OTB LargeScaleMeanShift", filetypes=[
             ("Batch/Executable", "*.bat *.exe"),
@@ -378,6 +394,14 @@ class ImageSelectorApp(ttk.Frame):
             self._invalidate_field(self.out_entry, msg="Select output directory")
             self._toast("Please select an output directory", kind="error")
             return
+        custom_aoi = (self.var_custom_aoi.get() or "").strip()
+        if custom_aoi:
+            if not os.path.exists(custom_aoi):
+                self._toast("Custom AOI shapefile not found", kind="error")
+                return
+            if Path(custom_aoi).suffix.lower() != ".shp":
+                self._toast("Custom AOI must be a .shp file", kind="error")
+                return
         if not self.var_otb_bin.get() or not os.path.exists(self.var_otb_bin.get()):
             self._invalidate_field(None, msg="Invalid OTB path")
             self._toast("Set a valid OTB LargeScaleMeanShift path", kind="error")
@@ -402,6 +426,7 @@ class ImageSelectorApp(ttk.Frame):
         def worker():
             from .segmentation import run_segmentation
             start0 = time.time()
+            custom_path = custom_aoi
 
             def make_cb(step: str):
                 def cb(done: int, total: int, note: str = ""):
@@ -411,25 +436,37 @@ class ImageSelectorApp(ttk.Frame):
 
             # Step 0: preselection (AOI)
             try:
-                min_w = self._parse_optional_float(self.var_pre_wmin.get(), 0.0) or 0.0
-                max_w = self._parse_optional_float(self.var_pre_wmax.get())
-                min_l = self._parse_optional_float(self.var_pre_lmin.get(), 0.0) or 0.0
-                max_l = self._parse_optional_float(self.var_pre_lmax.get())
-                small_buf = self._parse_optional_float(self.var_pre_small_buffer.get(), 0.3)
-                quant = max(0.0, min(1.0, float(self.var_pre_quantile.get() or 0.15)))
-                aoi_temp, n_polys = detect_cultivation_plots(
-                    raster_path=session.seg_in_raster,
-                    output_root=session.output_dir,
-                    min_width_m=min_w,
-                    max_width_m=max_w,
-                    min_length_m=min_l,
-                    max_length_m=max_l,
-                    small_polygon_buffer_m=small_buf,
-                    blue_quantile=quant,
-                    progress=make_cb("Preselection"),
-                )
-                aoi_final = save_preselection_to_output(aoi_temp, session.output_dir)
-                self._last_aoi_path = str(aoi_final)
+                if custom_path:
+                    aoi_final = save_preselection_to_output(custom_path, session.output_dir)
+                    self._last_aoi_path = str(aoi_final)
+                    try:
+                        n_polys = len(gpd.read_file(aoi_final))
+                    except Exception:
+                        n_polys = None
+                    msg = "Custom AOI ready"
+                    if n_polys is not None:
+                        msg = f"Custom AOI ready ({n_polys} polygons)"
+                    self.after(0, lambda m=msg: self._set_status(m))
+                else:
+                    min_w = self._parse_optional_float(self.var_pre_wmin.get(), 0.0) or 0.0
+                    max_w = self._parse_optional_float(self.var_pre_wmax.get())
+                    min_l = self._parse_optional_float(self.var_pre_lmin.get(), 0.0) or 0.0
+                    max_l = self._parse_optional_float(self.var_pre_lmax.get())
+                    small_buf = self._parse_optional_float(self.var_pre_small_buffer.get(), 0.3)
+                    quant = max(0.0, min(1.0, float(self.var_pre_quantile.get() or 0.15)))
+                    aoi_temp, n_polys = detect_cultivation_plots(
+                        raster_path=session.seg_in_raster,
+                        output_root=session.output_dir,
+                        min_width_m=min_w,
+                        max_width_m=max_w,
+                        min_length_m=min_l,
+                        max_length_m=max_l,
+                        small_polygon_buffer_m=small_buf,
+                        blue_quantile=quant,
+                        progress=make_cb("Preselection"),
+                    )
+                    aoi_final = save_preselection_to_output(aoi_temp, session.output_dir)
+                    self._last_aoi_path = str(aoi_final)
             except Exception as e:
                 self.after(0, lambda: self._on_workflow_failed(f"Preselection failed: {e}"))
                 return
@@ -524,6 +561,14 @@ class ImageSelectorApp(ttk.Frame):
             self._invalidate_field(self.out_entry, msg="Select output directory")
             self._toast("Please select an output directory", kind="error")
             return
+        custom_aoi = (self.var_custom_aoi.get() or "").strip()
+        if custom_aoi:
+            if not os.path.exists(custom_aoi):
+                self._toast("Custom AOI shapefile not found", kind="error")
+                return
+            if Path(custom_aoi).suffix.lower() != ".shp":
+                self._toast("Custom AOI must be a .shp file", kind="error")
+                return
 
         self._set_controls_state("disabled")
         self.progress.configure(value=0, maximum=100)
@@ -532,9 +577,27 @@ class ImageSelectorApp(ttk.Frame):
 
         def worker():
             start0 = time.time()
+            custom_path = custom_aoi
             def cb(done: int, total: int, note: str = ""):
                 self.after(0, self._update_progress, done, max(1, total), start0, note or "Preselection")
             try:
+                if custom_path:
+                    aoi_final = save_preselection_to_output(custom_path, self.output_dir)
+                    self._last_aoi_path = str(aoi_final)
+                    try:
+                        n_polys = len(gpd.read_file(aoi_final))
+                    except Exception:
+                        n_polys = None
+                    def done_ui_custom():
+                        self._set_controls_state("normal")
+                        self._set_status("Custom AOI ready")
+                        msg = f"Custom AOI saved to:\n{aoi_final}"
+                        if n_polys is not None:
+                            msg = f"Custom AOI: {n_polys} polygons\n{msg}"
+                        messagebox.showinfo("Preselection", msg)
+                    self.after(0, done_ui_custom)
+                    return
+
                 min_w = self._parse_optional_float(self.var_pre_wmin.get(), 0.0) or 0.0
                 max_w = self._parse_optional_float(self.var_pre_wmax.get())
                 min_l = self._parse_optional_float(self.var_pre_lmin.get(), 0.0) or 0.0

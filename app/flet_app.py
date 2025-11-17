@@ -415,6 +415,7 @@ def run_flet_app() -> None:
         in_raster = ft.TextField(value=default_in, expand=True)
         output_dir = ft.TextField(value=default_out, expand=True)
         otb_bin = ft.TextField(value=default_otb, expand=True)
+        custom_aoi = ft.TextField(value="", expand=True, hint_text="Optional AOI shapefile (.shp)")
         train_image = ft.TextField(value=default_in, expand=True, hint_text="Training image (GeoTIFF)")
 
         # Preselection controls (size-only workflow)
@@ -555,6 +556,13 @@ def run_flet_app() -> None:
                     otb_bin.value = e.files[0].path; otb_bin.update()
             except Exception:
                 pass
+        def on_pick_custom_aoi(e: ft.FilePickerResultEvent):
+            try:
+                if e.files:
+                    custom_aoi.value = e.files[0].path
+                    custom_aoi.update()
+            except Exception:
+                pass
         def on_pick_train_image(e: ft.FilePickerResultEvent):
             try:
                 if e.files:
@@ -565,40 +573,59 @@ def run_flet_app() -> None:
         fp_raster = ft.FilePicker(on_result=on_pick_raster)
         dp_output = ft.FilePicker(on_result=on_pick_output)
         fp_otb = ft.FilePicker(on_result=on_pick_otb)
+        fp_custom_aoi = ft.FilePicker(on_result=on_pick_custom_aoi)
         fp_train_image = ft.FilePicker(on_result=on_pick_train_image)
         # Classification pickers (defined later)
         fp_train = ft.FilePicker()
-        page.overlay.extend([fp_raster, dp_output, fp_otb, fp_train, fp_train_image])
+        page.overlay.extend([fp_raster, dp_output, fp_otb, fp_custom_aoi, fp_train, fp_train_image])
 
         # Actions
         def run_preselection_only():
             if not in_raster.value.strip() or not output_dir.value.strip():
                 step_text.value = "Please set input raster and output directory"; page.update(); return
+            custom_path = (custom_aoi.value or "").strip()
+            if custom_path and not os.path.exists(custom_path):
+                step_text.value = "Custom AOI shapefile not found"; page.update(); return
+            if custom_path and not custom_path.lower().endswith(".shp"):
+                step_text.value = "Custom AOI must be a .shp file"; page.update(); return
             def worker():
                 try:
-                    url = None
-                    min_w = _field_float(pre_wmin, 0.0) or 0.0
-                    max_w = _field_float(pre_wmax)
-                    min_l = _field_float(pre_lmin, 0.0) or 0.0
-                    max_l = _field_float(pre_lmax)
-                    small_buf = _field_float(pre_small_buffer, 0.3)
-                    quant = float(pre_quantile.value or 0.15)
-                    aoi_temp, n_polys = detect_cultivation_plots(
-                        raster_path=in_raster.value.strip(),
-                        output_root=output_dir.value.strip(),
-                        min_width_m=min_w,
-                        max_width_m=max_w,
-                        min_length_m=min_l,
-                        max_length_m=max_l,
-                        small_polygon_buffer_m=small_buf if small_buf is not None else 0.0,
-                        blue_quantile=quant,
-                        progress=lambda d,t,n: page.pubsub.send_all({"kind":"progress","text": f"Preselection: {n or ''}", "ratio": (0 if t==0 else d/max(1,t))}),
-                    )
-                    aoi_final = save_preselection_to_output(aoi_temp, output_dir.value.strip())
+                    if custom_path:
+                        page.pubsub.send_all({"kind": "progress", "text": "Using custom AOI shapefile", "ratio": 0.0})
+                        aoi_final = save_preselection_to_output(custom_path, output_dir.value.strip())
+                        try:
+                            n_polys = len(gpd.read_file(aoi_final))
+                        except Exception:
+                            n_polys = None
+                        lines = []
+                        if n_polys is not None:
+                            lines.append(f"Custom AOI: {n_polys} polygons")
+                        lines.append(f"Saved: {aoi_final}")
+                        result_msg = "\n".join(lines)
+                    else:
+                        min_w = _field_float(pre_wmin, 0.0) or 0.0
+                        max_w = _field_float(pre_wmax)
+                        min_l = _field_float(pre_lmin, 0.0) or 0.0
+                        max_l = _field_float(pre_lmax)
+                        small_buf = _field_float(pre_small_buffer, 0.3)
+                        quant = float(pre_quantile.value or 0.15)
+                        aoi_temp, n_polys = detect_cultivation_plots(
+                            raster_path=in_raster.value.strip(),
+                            output_root=output_dir.value.strip(),
+                            min_width_m=min_w,
+                            max_width_m=max_w,
+                            min_length_m=min_l,
+                            max_length_m=max_l,
+                            small_polygon_buffer_m=small_buf if small_buf is not None else 0.0,
+                            blue_quantile=quant,
+                            progress=lambda d,t,n: page.pubsub.send_all({"kind":"progress","text": f"Preselection: {n or ''}", "ratio": (0 if t==0 else d/max(1,t))}),
+                        )
+                        aoi_final = save_preselection_to_output(aoi_temp, output_dir.value.strip())
+                        result_msg = f"Preselection: {n_polys} polygons\nSaved: {aoi_final}"
                     path = build_preview_html(aoi_final, in_raster.value.strip())
                     if path:
                         page.pubsub.send_all({"kind": "preview", "path": path})
-                    page.pubsub.send_all({"kind":"result","text": f"Preselection: {n_polys} polygons\nSaved: {aoi_final}"})
+                    page.pubsub.send_all({"kind":"result","text": result_msg})
                 except Exception as ex:  # noqa: BLE001
                     page.pubsub.send_all({"kind":"result","text": f"Preselection failed: {ex}"})
             threading.Thread(target=worker, daemon=True).start()
@@ -614,36 +641,57 @@ def run_flet_app() -> None:
                 step_text.value = "Select a model before running the workflow"
                 page.update()
                 return
+            custom_path = (custom_aoi.value or "").strip()
+            if custom_path and not os.path.exists(custom_path):
+                step_text.value = "Custom AOI shapefile not found"; page.update(); return
+            if custom_path and not custom_path.lower().endswith(".shp"):
+                step_text.value = "Custom AOI must be a .shp file"; page.update(); return
             def worker():
                 try:
                     # Preselection first
-                    min_w = _field_float(pre_wmin, 0.0) or 0.0
-                    max_w = _field_float(pre_wmax)
-                    min_l = _field_float(pre_lmin, 0.0) or 0.0
-                    max_l = _field_float(pre_lmax)
-                    small_buf = _field_float(pre_small_buffer, 0.3)
-                    quant = float(pre_quantile.value or 0.15)
-                    aoi_temp, _ = detect_cultivation_plots(
-                        raster_path=in_raster.value.strip(),
-                        output_root=output_dir.value.strip(),
-                        min_width_m=min_w,
-                        max_width_m=max_w,
-                        min_length_m=min_l,
-                        max_length_m=max_l,
-                        small_polygon_buffer_m=small_buf if small_buf is not None else 0.0,
-                        blue_quantile=quant,
-                        progress=lambda d,t,n: page.pubsub.send_all({"kind":"progress","text": "Preselection", "ratio": (0 if t==0 else d/max(1,t))}),
-                    )
-                    aoi_final = save_preselection_to_output(aoi_temp, output_dir.value.strip())
+                    custom_path_local = custom_path
+                    if custom_path_local:
+                        page.pubsub.send_all({"kind": "progress", "text": "Using custom AOI shapefile", "ratio": 0.0})
+                        aoi_final = save_preselection_to_output(custom_path_local, output_dir.value.strip())
+                        try:
+                            n_polys = len(gpd.read_file(aoi_final))
+                        except Exception:
+                            n_polys = None
+                        lines = []
+                        if n_polys is not None:
+                            lines.append(f"Custom AOI: {n_polys} polygons")
+                        lines.append(f"Saved: {aoi_final}")
+                        result_msg = "\n".join(lines)
+                    else:
+                        min_w = _field_float(pre_wmin, 0.0) or 0.0
+                        max_w = _field_float(pre_wmax)
+                        min_l = _field_float(pre_lmin, 0.0) or 0.0
+                        max_l = _field_float(pre_lmax)
+                        small_buf = _field_float(pre_small_buffer, 0.3)
+                        quant = float(pre_quantile.value or 0.15)
+                        aoi_temp, n_polys = detect_cultivation_plots(
+                            raster_path=in_raster.value.strip(),
+                            output_root=output_dir.value.strip(),
+                            min_width_m=min_w,
+                            max_width_m=max_w,
+                            min_length_m=min_l,
+                            max_length_m=max_l,
+                            small_polygon_buffer_m=small_buf if small_buf is not None else 0.0,
+                            blue_quantile=quant,
+                            progress=lambda d,t,n: page.pubsub.send_all({"kind":"progress","text": "Preselection", "ratio": (0 if t==0 else d/max(1,t))}),
+                        )
+                        aoi_final = save_preselection_to_output(aoi_temp, output_dir.value.strip())
+                        result_msg = f"Preselection: {n_polys} polygons\nSaved: {aoi_final}"
                     path = build_preview_html(aoi_final, in_raster.value.strip())
                     if path:
                         page.pubsub.send_all({"kind": "preview", "path": path})
+                    page.pubsub.send_all({"kind": "result", "text": result_msg})
                     confirm_event = threading.Event()
                     workflow_gate["event"] = confirm_event
                     page.pubsub.send_all({
                         "kind": "await_polygons",
                         "text": "Review polygons and click Confirm to continue.",
-                        "detail": f"Preselection saved to: {aoi_final}",
+                        "detail": result_msg,
                     })
                     confirm_event.wait()
                     workflow_gate["event"] = None
@@ -782,6 +830,23 @@ def run_flet_app() -> None:
             labeled_row("Input raster", ft.Row([in_raster, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_raster.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.IMAGE_OUTLINED, tip="Path to input imagery (GeoTIFF)."),
             labeled_row("Output directory", ft.Row([output_dir, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: dp_output.get_directory_path())], expand=True), icon=ft.icons.FOLDER, tip="Folder where results will be written."),
             labeled_row("OTB path", ft.Row([otb_bin, ft.OutlinedButton("Browse", icon=ft.icons.BUILD_OUTLINED, on_click=lambda _: fp_otb.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.BUILD_OUTLINED, tip="Path to OTB LargeScaleMeanShift executable."),
+            labeled_row(
+                "Custom AOI (.shp)",
+                ft.Row(
+                    [
+                        custom_aoi,
+                        ft.OutlinedButton(
+                            "Browse",
+                            icon=ft.icons.MAP,
+                            on_click=lambda _: fp_custom_aoi.pick_files(allow_multiple=False),
+                        ),
+                    ],
+                    spacing=6,
+                    expand=True,
+                ),
+                icon=ft.icons.MAP,
+                tip="Optional shapefile used as the AOI. When set, preselection is skipped and this file opens in the editor.",
+            ),
             subtitle="Set inputs and outputs.",
             bgcolor=pal["alt"],
             expanded=True,
