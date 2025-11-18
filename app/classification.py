@@ -23,6 +23,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+try:
+    from .map_preview import build_classification_map as _build_classification_map  # type: ignore
+except Exception:  # noqa: BLE001
+    try:
+        from map_preview import build_classification_map as _build_classification_map  # type: ignore
+    except Exception:  # noqa: BLE001
+        _build_classification_map = None
+
 
 Progress = Callable[[int, int, str], None]
 
@@ -41,6 +49,7 @@ class TrainResult:
 class ApplyResult:
     output_path: Path
     duration_sec: float
+    preview_map: Optional[Path] = None
 
 
 def _model_dir(base_out: Path) -> Path:
@@ -369,6 +378,7 @@ def apply_model_with_pixel_sampling(
     output_root: str | os.PathLike,
     max_pixels_per_polygon: int = 200,
     progress: Optional[Progress] = None,
+    generate_preview: bool = False,
 ) -> ApplyResult:
     payload = joblib.load(model_path)
     rf: RandomForestClassifier = payload["model"]
@@ -525,4 +535,10 @@ def apply_model_with_pixel_sampling(
     gdf = gdf[keep_cols]
     out_path = folder / f"Classification_{ts}.shp"
     gdf.to_file(out_path)
-    return ApplyResult(output_path=out_path, duration_sec=time.time() - start)
+    preview_path: Optional[Path] = None
+    if generate_preview and _build_classification_map is not None:
+        try:
+            preview_path = _build_classification_map(out_path, raster_path, mode="rf")
+        except Exception:
+            preview_path = None
+    return ApplyResult(output_path=out_path, duration_sec=time.time() - start, preview_map=preview_path)

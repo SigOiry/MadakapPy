@@ -673,15 +673,10 @@ class ImageSelectorApp(ttk.Frame):
                         session.output_dir,
                         max_pixels_per_polygon=cap_pol,
                         progress=make_cb("Classifying"),
+                        generate_preview=True,
                     )
-                    try:
-                        preview_path = build_classification_map(
-                            apply_res.output_path, session.seg_in_raster, mode="rf"
-                        )
-                    except Exception:
-                        preview_path = None
-                    if preview_path:
-                        self.after(0, lambda p=preview_path: self._display_classification_preview(p))
+                    if apply_res.preview_map:
+                        self.after(0, lambda p=apply_res.preview_map: self._display_classification_preview(p))
                     self.after(0, lambda: self._on_workflow_done(apply_res.output_path))
                 else:
                     from .simple_classifier import classify_dark_linear_polygons
@@ -1089,10 +1084,13 @@ class ImageSelectorApp(ttk.Frame):
                     out_root,
                     max_pixels_per_polygon=cap,
                     progress=cb,
+                    generate_preview=True,
                 )
                 def ok():
                     self._set_status("Classification complete")
                     messagebox.showinfo("Done", f"Classification written to:\n{res.output_path}")
+                    if res.preview_map:
+                        self._display_classification_preview(res.preview_map)
                 self.after(0, ok)
             except Exception as e:
                 msg = str(e)

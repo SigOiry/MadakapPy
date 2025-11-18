@@ -221,6 +221,14 @@ def run_flet_app() -> None:
                     result_text.value = msg.get("text", "")
                 elif kind == "error":
                     step_text.value = f"Error: {msg.get('text','')}"
+                elif kind == "preview_map":
+                    p = msg.get("path")
+                    if p:
+                        try:
+                            page.launch_url("file:///" + str(Path(p).resolve()).replace("\\", "/"))
+                            step_text.value = "Opened classification preview map"
+                        except Exception:
+                            step_text.value = f"Preview saved to: {p}"
                 page.update()
             except Exception:
                 pass
@@ -412,9 +420,12 @@ def run_flet_app() -> None:
                         output_root=output_dir.value.strip(),
                         max_pixels_per_polygon=mpp,
                         progress=cb_apply,
+                        generate_preview=True,
                     )
                     page.pubsub.send_all({"kind": "progress", "text": "Workflow complete", "ratio": 1.0})
                     page.pubsub.send_all({"kind": "result", "text": f"Output: {ares.output_path}"})
+                    if ares.preview_map:
+                        page.pubsub.send_all({"kind": "preview_map", "path": str(ares.preview_map)})
                 except Exception as ex:  # noqa: BLE001
                     page.pubsub.send_all({"kind": "error", "text": str(ex)})
 

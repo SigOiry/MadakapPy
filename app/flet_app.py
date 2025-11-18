@@ -271,19 +271,32 @@ def run_flet_app() -> None:
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.13.0/dist/leaflet-geoman.css" />
   <style>
-    html, body, #map { width: 100%; height: 100%; margin: 0; padding: 0; }
-    .toolbar { position: absolute; top: 10px; right: 10px; display: flex; gap: 8px; align-items: center; font-family: sans-serif; }
+    html, body { width: 100%; height: 100%; margin: 0; padding: 0; }
+    body { display: flex; flex-direction: column; font-family: sans-serif; }
+    #map { flex: 1; width: 100%; }
+    .toolbar {
+      position: sticky;
+      top: 0;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+      padding: 10px;
+      background: rgba(255,255,255,0.95);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+      z-index: 1000;
+    }
     #saveBtn { padding: 6px 12px; border: none; border-radius: 6px; background: #0b8457; color: #fff; cursor: pointer; font-weight: 600; }
     #saveBtn:hover { background: #0a704a; }
     .status { padding: 6px 10px; border-radius: 6px; color: #fff; background: rgba(0,0,0,0.6); }
   </style>
 </head>
 <body>
-  <div id="map"></div>
   <div class="toolbar">
     <button id="saveBtn" title="Write current polygons to the shapefile.">Save edits</button>
     <div class="status" id="status">Ready</div>
   </div>
+  <div id="map"></div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.13.0/dist/leaflet-geoman.min.js"></script>
   <script>
@@ -885,6 +898,7 @@ def run_flet_app() -> None:
                                         "ratio": (0 if t == 0 else d / max(1, t)),
                                     }
                                 ),
+                                generate_preview=True,
                             )
                             page.pubsub.send_all(
                                 {
@@ -892,12 +906,7 @@ def run_flet_app() -> None:
                                     "text": f"Workflow complete. Classification saved to:\n{cls_res.output_path}",
                                 }
                             )
-                            try:
-                                preview_path = build_classification_map(
-                                    cls_res.output_path, in_raster.value.strip(), mode="rf"
-                                )
-                            except Exception:
-                                preview_path = None
+                            preview_path = cls_res.preview_map
                             if preview_path:
                                 page.pubsub.send_all({"kind": "classification_preview", "path": str(preview_path)})
                         else:
