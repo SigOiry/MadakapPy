@@ -61,6 +61,7 @@ class ImageSelectorApp(ttk.Frame):
         # Classification parameters
         self.var_model_path = tk.StringVar()
         self.var_classifier_mode = tk.StringVar(value="rf")
+        self.var_biomass_model = tk.StringVar(value="madagascar")
         self.var_train_raster = tk.StringVar(value=self.var_in_raster.get())
         self.var_train_path = tk.StringVar()
         self.var_class_col = tk.StringVar()
@@ -290,6 +291,16 @@ class ImageSelectorApp(ttk.Frame):
         self.max_pixels_entry = ttk.Entry(applyf, textvariable=self.var_max_pixels_per_polygon, width=12)
         self.max_pixels_entry.grid(row=0, column=1, sticky="w", padx=6, pady=4)
         self._rf_controls.append(self.max_pixels_entry)
+        ttk.Label(applyf, text="Biomass model").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.cmb_biomass_model = ttk.Combobox(
+            applyf,
+            values=("madagascar", "indonesia"),
+            textvariable=self.var_biomass_model,
+            state="readonly",
+            width=18,
+        )
+        self.cmb_biomass_model.grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        self.cmb_biomass_model.current(0)
         # Apply happens as part of full workflow
 
         # Footer / status
@@ -520,6 +531,7 @@ class ImageSelectorApp(ttk.Frame):
             seg_spatialr=int(self.var_spatialr.get()),
             seg_minsize=int(self.var_minsize.get()),
             seg_otb_bin=self.var_otb_bin.get() or None,
+            biomass_model=(self.var_biomass_model.get() or "madagascar").strip().lower(),
         )
         save_session(session, Path(self.output_dir))
 
@@ -674,6 +686,8 @@ class ImageSelectorApp(ttk.Frame):
                         max_pixels_per_polygon=cap_pol,
                         progress=make_cb("Classifying"),
                         generate_preview=True,
+                        aoi_path=self._last_aoi_path,
+                        biomass_model=session.biomass_model,
                     )
                     if apply_res.preview_map:
                         self.after(0, lambda p=apply_res.preview_map: self._display_classification_preview(p))
@@ -685,13 +699,18 @@ class ImageSelectorApp(ttk.Frame):
                         session.seg_in_raster,
                         self._last_seg_path,
                         session.output_dir,
+                        biomass_model=session.biomass_model,
                         progress=make_cb("Statistics"),
                     )
                     summary = f"Statistics classifier: {stats_res.selected_count} polygons selected by spectral rules."
                     self.after(0, lambda: self._set_status(summary))
                     try:
                         preview_path = build_classification_map(
-                            stats_res.output_path, session.seg_in_raster, mode="stats"
+                            stats_res.output_path,
+                            session.seg_in_raster,
+                            mode="stats",
+                            aoi_path=self._last_aoi_path,
+                            biomass_model=session.biomass_model,
                         )
                     except Exception:
                         preview_path = None
@@ -1085,6 +1104,8 @@ class ImageSelectorApp(ttk.Frame):
                     max_pixels_per_polygon=cap,
                     progress=cb,
                     generate_preview=True,
+                    aoi_path=self._last_aoi_path,
+                    biomass_model=(self.var_biomass_model.get() or "madagascar").strip().lower(),
                 )
                 def ok():
                     self._set_status("Classification complete")

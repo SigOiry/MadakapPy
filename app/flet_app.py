@@ -7,7 +7,7 @@ import shutil
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 
 def run_flet_app() -> None:
@@ -169,6 +169,99 @@ def run_flet_app() -> None:
                     pass
         except Exception:
             pass
+
+    def _normalized_path(path_str: str | None) -> Optional[Path]:
+        txt = (path_str or "").strip()
+        if not txt:
+            return None
+        try:
+            path = Path(txt).expanduser()
+            if not path.is_absolute():
+                path = (Path.cwd() / path).resolve()
+            else:
+                path = path.resolve()
+        except Exception:
+            try:
+                path = Path(txt).expanduser().absolute()
+            except Exception:
+                return None
+        return path
+
+    def _history_root_for_output(path_str: str | None) -> Optional[Path]:
+        base = _normalized_path(path_str)
+        if base is None:
+            return None
+        return base if base.name.lower() == "output" else base / "Output"
+
+    def _history_file_for_output(path_str: str | None) -> Optional[Path]:
+        root = _history_root_for_output(path_str)
+        if root is None:
+            return None
+        return root / "run_history.json"
+
+    def _load_run_history(path_str: str | None) -> list[dict[str, Any]]:
+        fp = _history_file_for_output(path_str)
+        if fp is None or not fp.exists():
+            return []
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+        except Exception:
+            pass
+        return []
+
+    def _append_run_history(path_str: str | None, record: dict[str, Any]) -> Optional[dict[str, Any]]:
+        root = _history_root_for_output(path_str)
+        if root is None:
+            return None
+        entry = dict(record)
+        entry["output_root"] = str(root)
+        fp = root / "run_history.json"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            existing = json.loads(fp.read_text(encoding="utf-8")) if fp.exists() else []
+        except Exception:
+            existing = []
+        if not isinstance(existing, list):
+            existing = []
+        existing.append(entry)
+        if len(existing) > 200:
+            existing = existing[-200:]
+        try:
+            fp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return entry
+
+    def _update_history_record(history_root: str | None, run_id: str, updates: dict[str, Any]) -> None:
+        if not history_root or not run_id or not updates:
+            return
+        fp = Path(history_root) / "run_history.json"
+        if not fp.exists():
+            return
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, list):
+            return
+        updated = False
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") == run_id:
+                item.update(updates)
+                updated = True
+                break
+        if updated:
+            try:
+                fp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
     def _ensure_edit_server(shp_path: Path, target_crs: str | None) -> int:
         key = str(shp_path.resolve())
@@ -504,11 +597,171 @@ def run_flet_app() -> None:
             disabled=True,
         )
 
+        history_state: dict[str, Any] = {"records": [], "selected_id": None, "current_root": None}
+        history_hint = ft.Text("", size=12, color=pal["muted"])
+        history_list = ft.ListView(height=240, spacing=4, auto_scroll=False, controls=[])
+        history_summary = ft.Text("Select a run to see details.", selectable=True, color=pal["muted"])
+        history_settings = ft.Text("", selectable=True, color=pal["muted"], size=12, font_family="Consolas")
+
+        def _current_history_root_str() -> Optional[str]:
+            root = _history_root_for_output((output_dir.value or "").strip())
+            return str(root) if root else None
+
+        def _set_history_records(records: list[dict[str, Any]]) -> None:
+            history_state["records"] = records
+            display = list(reversed(records))
+            tiles: list[ft.Control] = []
+            if not display:
+                tiles.append(
+                    ft.ListTile(
+                        title=ft.Text("No runs saved yet.", color=pal["muted"]),
+                        leading=ft.Icon(ft.icons.INBOX, color=pal["muted"]),
+                    )
+                )
+            else:
+                for rec in display:
+                    rid = rec.get("id")
+                    title = rec.get("label") or rid or "Workflow run"
+                    subtitle = rec.get("summary") or rec.get("result_path") or ""
+                    subtitle = (subtitle.splitlines()[0][:120]) if subtitle else ""
+                    tiles.append(
+                        ft.ListTile(
+                            title=ft.Text(title),
+                            subtitle=ft.Text(subtitle) if subtitle else None,
+                            on_click=lambda e, rid=rid: select_history_record(rid),
+                            trailing=ft.Icon(ft.icons.MAP, color=pal["muted"]),
+                        )
+                    )
+            history_list.controls = tiles
+            history_list.update()
+
+        def refresh_history_panel(_=None) -> None:
+            root = _current_history_root_str()
+            history_state["current_root"] = root
+            history_hint.value = f"Stored under: {root}" if root else "Set a valid output directory to see saved runs."
+            records = _load_run_history((output_dir.value or "").strip()) if root else []
+            _set_history_records(records)
+            history_summary.value = "Select a run to see details."
+            history_settings.value = ""
+            history_hint.update()
+            history_summary.update()
+            history_settings.update()
+
+        def select_history_record(run_id: str | None) -> None:
+            if not run_id:
+                return
+            record = next((rec for rec in history_state.get("records", []) if rec.get("id") == run_id), None)
+            if not record:
+                return
+            history_state["selected_id"] = run_id
+            metrics = record.get("metrics") or {}
+            summary_lines = [
+                f"Run: {record.get('label', run_id)}",
+                f"Result: {record.get('result_path', 'Unknown')}",
+            ]
+            if metrics:
+                summary_lines.append(
+                    f"AOIs: {metrics.get('aois', 'n/a')} | Segments: {metrics.get('segments', 'n/a')}"
+                )
+            summary_lines.append(record.get("summary", ""))
+            history_summary.value = "\n".join(line for line in summary_lines if line)
+            settings_payload = record.get("settings") or {}
+            history_settings.value = json.dumps(settings_payload, indent=2, ensure_ascii=False) if settings_payload else ""
+            history_summary.update()
+            history_settings.update()
+            _launch_history_preview(record)
+
+        def _launch_history_preview(record: dict[str, Any]) -> None:
+            preview = record.get("preview_map")
+            if preview and os.path.exists(preview):
+                page.pubsub.send_all({"kind": "classification_preview", "path": preview})
+                return
+            shp = record.get("result_path")
+            raster = (record.get("settings") or {}).get("input_raster")
+            if not shp or not raster or not os.path.exists(shp) or not os.path.exists(raster):
+                page.pubsub.send_all(
+                    {"kind": "result", "text": "Preview unavailable because the saved files are missing."}
+                )
+                return
+
+            def _worker():
+                try:
+                    mode_val = record.get("mode") or "rf"
+                    bm = (
+                        ((record.get("settings") or {}).get("classification") or {}).get("biomass_model")
+                        or "madagascar"
+                    )
+                    new_preview = build_classification_map(
+                        shp,
+                        raster,
+                        mode="stats" if mode_val == "stats" else "rf",
+                        aoi_path=record.get("aoi_path"),
+                        biomass_model=bm,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    page.pubsub.send_all({"kind": "result", "text": f"Failed to rebuild preview: {exc}"})
+                    return
+                if new_preview:
+                    record["preview_map"] = str(new_preview)
+                    _update_history_record(record.get("output_root"), record.get("id"), {"preview_map": str(new_preview)})
+                    page.pubsub.send_all({"kind": "classification_preview", "path": str(new_preview)})
+
+            threading.Thread(target=_worker, daemon=True).start()
+
         def _field_float(field: ft.TextField, default: float | None = None) -> float | None:
             txt = (field.value or "").strip()
             if not txt:
                 return default
             return float(txt)
+
+        def _field_int(field: ft.TextField, default: int) -> int:
+            try:
+                txt = (field.value or "").strip()
+                return int(txt) if txt else default
+            except Exception:
+                return default
+
+        def collect_run_settings() -> dict[str, Any]:
+            def _clean(field: ft.TextField) -> str:
+                return (field.value or "").strip()
+
+            pre_vals = {
+                "min_width_m": _field_float(pre_wmin),
+                "max_width_m": _field_float(pre_wmax),
+                "min_length_m": _field_float(pre_lmin),
+                "max_length_m": _field_float(pre_lmax),
+                "small_polygon_buffer_m": _field_float(pre_small_buffer, 0.3),
+                "blue_quantile": float(pre_quantile.value or 0.0),
+                "enabled": not bool(_clean(custom_aoi)),
+            }
+            seg_vals = {
+                "tile_size_m": _field_int(tile_size, 40),
+                "spatialr": _field_int(spatialr, 5),
+                "minsize": _field_int(minsize, 5),
+            }
+            clf_vals = {
+                "mode": (classifier_mode.value or "rf"),
+                "model_path": _clean(model_path),
+                "max_pixels_per_polygon": _field_int(max_pixels_per_polygon, 200),
+                "biomass_model": (biomass_model.value or "madagascar"),
+            }
+            train_vals = {
+                "training_image": _clean(train_image),
+                "training_polygons": _clean(train_polys),
+                "class_column": (class_column.value or "").strip(),
+                "max_pixels_per_class": _field_int(max_pixels_per_class, 0),
+            }
+            return {
+                "input_raster": _clean(in_raster),
+                "output_dir": _clean(output_dir),
+                "otb_path": _clean(otb_bin),
+                "custom_aoi": _clean(custom_aoi),
+                "aoi_source": "custom" if _clean(custom_aoi) else "preselection",
+                "preselection": pre_vals,
+                "segmentation": seg_vals,
+                "classification": clf_vals,
+                "training": train_vals,
+            }
 
         def on_msg(msg: dict):
             try:
@@ -571,6 +824,12 @@ def run_flet_app() -> None:
                     result_text.value = msg.get("text", "Workflow complete")
                     confirm_btn.visible = False
                     confirm_btn.disabled = True
+                elif kind == "history_update":
+                    record = msg.get("record")
+                    if isinstance(record, dict):
+                        target_root = record.get("output_root")
+                        if target_root and target_root == _current_history_root_str():
+                            refresh_history_panel()
                 elif kind == "await_polygons":
                     step_text.value = msg.get("text", "Review polygons")
                     detail = msg.get("detail")
@@ -615,6 +874,7 @@ def run_flet_app() -> None:
                 p = getattr(e, "path", None)
                 if p:
                     output_dir.value = p; output_dir.update()
+                    refresh_history_panel()
             except Exception:
                 pass
         def on_pick_otb(e: ft.FilePickerResultEvent):
@@ -656,6 +916,7 @@ def run_flet_app() -> None:
                 step_text.value = "Custom AOI shapefile not found"; page.update(); return
             if custom_path and not custom_path.lower().endswith(".shp"):
                 step_text.value = "Custom AOI must be a .shp file"; page.update(); return
+            settings_snapshot = collect_run_settings()
             def worker():
                 try:
                     if custom_path:
@@ -715,8 +976,12 @@ def run_flet_app() -> None:
                 step_text.value = "Custom AOI shapefile not found"; page.update(); return
             if custom_path and not custom_path.lower().endswith(".shp"):
                 step_text.value = "Custom AOI must be a .shp file"; page.update(); return
+            settings_snapshot = collect_run_settings()
             def worker():
                 try:
+                    bio_model = (
+                        (settings_snapshot.get("classification") or {}).get("biomass_model") or "madagascar"
+                    )
                     mode_local = mode_sel
                     # Preselection first
                     custom_path_local = custom_path
@@ -767,16 +1032,9 @@ def run_flet_app() -> None:
                     workflow_gate["event"] = None
 
                     # Parse segmentation parameters
-                    def _safe_int(field, default: int) -> int:
-                        try:
-                            txt = (field.value or "").strip()
-                            return int(txt) if txt else default
-                        except Exception:
-                            return default
-
-                    tile_sz = _safe_int(tile_size, 40)
-                    spatial = _safe_int(spatialr, 5)
-                    mins = _safe_int(minsize, 5)
+                    tile_sz = _field_int(tile_size, 40)
+                    spatial = _field_int(spatialr, 5)
+                    mins = _field_int(minsize, 5)
 
                     # Classification settings
                     cap_pol = 200
@@ -884,6 +1142,9 @@ def run_flet_app() -> None:
                     page.pubsub.send_all({"kind": "result", "text": "Segments merged. Running classification..."})
 
                     try:
+                        preview_path = None
+                        summary_text = ""
+                        result_output_path: Optional[str] = None
                         if mode_local == "rf":
                             cls_res = apply_model_with_pixel_sampling(
                                 in_raster.value.strip(),
@@ -899,21 +1160,19 @@ def run_flet_app() -> None:
                                     }
                                 ),
                                 generate_preview=True,
+                                aoi_path=aoi_final,
+                                biomass_model=bio_model,
                             )
-                            page.pubsub.send_all(
-                                {
-                                    "kind": "result",
-                                    "text": f"Workflow complete. Classification saved to:\n{cls_res.output_path}",
-                                }
-                            )
+                            summary_text = f"Workflow complete. Classification saved to:\n{cls_res.output_path}"
+                            result_output_path = str(cls_res.output_path)
+                            page.pubsub.send_all({"kind": "result", "text": summary_text})
                             preview_path = cls_res.preview_map
-                            if preview_path:
-                                page.pubsub.send_all({"kind": "classification_preview", "path": str(preview_path)})
                         else:
                             stats_res = classify_dark_linear_polygons(
                                 in_raster.value.strip(),
                                 str(combined_path),
                                 output_dir.value.strip(),
+                                biomass_model=bio_model,
                                 progress=lambda d, t, n: page.pubsub.send_all(
                                     {
                                         "kind": "progress",
@@ -922,24 +1181,49 @@ def run_flet_app() -> None:
                                     }
                                 ),
                             )
-                            page.pubsub.send_all(
-                                {
-                                    "kind": "result",
-                                    "text": (
-                                        "Workflow complete (statistics classifier).\n"
-                                        f"Selected {stats_res.selected_count} polygons via spectral rules.\n"
-                                        f"Saved to:\n{stats_res.output_path}"
-                                    ),
-                                }
+                            summary_text = (
+                                "Workflow complete (statistics classifier).\n"
+                                f"Selected {stats_res.selected_count} polygons via spectral rules.\n"
+                                f"Saved to:\n{stats_res.output_path}"
                             )
+                            result_output_path = str(stats_res.output_path)
+                            page.pubsub.send_all({"kind": "result", "text": summary_text})
                             try:
                                 preview_path = build_classification_map(
-                                    stats_res.output_path, in_raster.value.strip(), mode="stats"
+                                    stats_res.output_path,
+                                    in_raster.value.strip(),
+                                    mode="stats",
+                                    aoi_path=aoi_final,
+                                    biomass_model=bio_model,
                                 )
                             except Exception:
                                 preview_path = None
-                            if preview_path:
-                                page.pubsub.send_all({"kind": "classification_preview", "path": str(preview_path)})
+                        if preview_path:
+                            page.pubsub.send_all({"kind": "classification_preview", "path": str(preview_path)})
+                        if result_output_path:
+                            completed = datetime.now()
+                            label = completed.strftime("%Y-%m-%d %H:%M:%S")
+                            metrics = {"aois": int(n_aoi), "segments": int(len(combined))}
+                            try:
+                                safe_settings = json.loads(json.dumps(settings_snapshot))
+                            except Exception:
+                                safe_settings = settings_snapshot
+                            record = {
+                                "id": run_ts,
+                                "label": f"{label} ({(mode_local or '').upper()})",
+                                "mode": mode_local,
+                                "completed_at": completed.isoformat(),
+                                "summary": summary_text,
+                                "result_path": result_output_path,
+                                "preview_map": str(preview_path) if preview_path else None,
+                                "aoi_path": str(aoi_final),
+                                "run_folder": str(Path(result_output_path).parent),
+                                "settings": safe_settings,
+                                "metrics": metrics,
+                            }
+                            stored = _append_run_history(settings_snapshot.get("output_dir"), record)
+                            if stored:
+                                page.pubsub.send_all({"kind": "history_update", "record": stored})
                         _cleanup_root_tiffs()
                         page.pubsub.send_all({"kind": "workflow_done", "text": "Workflow complete."})
                     finally:
@@ -1041,6 +1325,14 @@ def run_flet_app() -> None:
         )
         model_hint = ft.Text("", size=12, color=pal["muted"])
         max_pixels_per_polygon = ft.TextField(value="200", width=120, hint_text="Pixels/polygon", text_align=ft.TextAlign.RIGHT)
+        biomass_model = ft.Dropdown(
+            value="madagascar",
+            options=[
+                ft.dropdown.Option(key="madagascar", text="Madagascar (poly)"),
+                ft.dropdown.Option(key="indonesia", text="Indonesia (power)"),
+            ],
+            width=220,
+        )
         train_polys = ft.TextField(value="", expand=True, hint_text="Training polygons (.shp/.gpkg/.geojson)")
         class_column = ft.Dropdown(options=[], expand=True)
         max_pixels_per_class = ft.TextField(value="0", width=120, hint_text="0 = no cap")
@@ -1162,6 +1454,12 @@ def run_flet_app() -> None:
                 max_pixels_per_polygon,
                 icon=ft.icons.SPEED,
                 tip="Number of pixels sampled in each polygon when applying the model.",
+            ),
+            labeled_row(
+                "Biomass model",
+                biomass_model,
+                icon=ft.icons.BIOTECH,
+                tip="Choose the biomass estimation curve used in outputs and previews.",
             ),
             train_tab_btn,
             subtitle="Choose between a trained Random Forest and the simple statistics classifier.",
@@ -1351,6 +1649,67 @@ def run_flet_app() -> None:
             spacing=12,
         )
 
+        result_panel = ft.Column(
+            [result_text, confirm_btn],
+            spacing=6,
+            horizontal_alignment=ft.CrossAxisAlignment.START,
+        )
+
+        history_refresh_btn = ft.IconButton(
+            icon=ft.icons.REFRESH,
+            tooltip="Reload saved runs",
+            on_click=refresh_history_panel,
+        )
+        history_panel = section(
+            "Processed Runs",
+            ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Container(history_hint, expand=True),
+                            history_refresh_btn,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Row(
+                        [
+                            ft.Container(history_list, expand=1),
+                            ft.Column(
+                                [
+                                    ft.Text("Summary", weight=ft.FontWeight.W_600, color=pal["muted"]),
+                                    history_summary,
+                                    ft.Text("Saved inputs", weight=ft.FontWeight.W_600, color=pal["muted"]),
+                                    ft.Container(
+                                        history_settings,
+                                        border=ft.border.all(1, pal["border"]),
+                                        padding=10,
+                                        bgcolor=pal["alt"],
+                                        height=240,
+                                    ),
+                                ],
+                                spacing=6,
+                                expand=1,
+                            ),
+                        ],
+                        spacing=12,
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    ),
+                ],
+                spacing=10,
+            ),
+            icon=ft.icons.HISTORY,
+            subtitle="Select a processed run to review its settings and reopen the map.",
+            bgcolor=pal["card"],
+            expanded=True,
+        )
+        catalogue_body = ft.Column(
+            [
+                history_panel,
+            ],
+            expand=True,
+            spacing=12,
+        )
+
         tabs = ft.Tabs(
             ref=tabs_ref,
             selected_index=0,
@@ -1358,13 +1717,8 @@ def run_flet_app() -> None:
             tabs=[
                 ft.Tab(text="Workflow", content=workflow_body),
                 ft.Tab(text="Train Model", content=training_body),
+                ft.Tab(text="Catalogue", content=catalogue_body),
             ],
-        )
-
-        result_panel = ft.Column(
-            [result_text, confirm_btn],
-            spacing=6,
-            horizontal_alignment=ft.CrossAxisAlignment.START,
         )
 
         page.add(
@@ -1382,6 +1736,7 @@ def run_flet_app() -> None:
 
         sync_classifier_mode()
         refresh_model_list()
+        refresh_history_panel()
 
     import flet as ft  # type: ignore
     ft.app(target=main)

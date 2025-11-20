@@ -58,6 +58,16 @@ def _model_dir(base_out: Path) -> Path:
     return base_out / "Model"
 
 
+def _biomass_from_area_cm2(area_cm2: np.ndarray | float, model: str) -> np.ndarray:
+    arr = np.asarray(area_cm2, dtype=np.float64)
+    arr = np.maximum(arr, 0.0)
+    model_key = (model or "madagascar").strip().lower()
+    if model_key == "indonesia":
+        with np.errstate(invalid="ignore"):
+            return 0.014 * np.power(arr, 1.65)
+    return (-0.0022 * arr * arr) + (2.3389 * arr) + 29.771
+
+
 def _rf_features_for_polygon(src: rasterio.io.DatasetReader, geom) -> np.ndarray:
     data, _ = rio_mask(src, [mapping(geom)], crop=True, filled=False)
     data = data.astype("float32")
@@ -379,6 +389,8 @@ def apply_model_with_pixel_sampling(
     max_pixels_per_polygon: int = 200,
     progress: Optional[Progress] = None,
     generate_preview: bool = False,
+    aoi_path: str | os.PathLike | None = None,
+    biomass_model: str = "madagascar",
 ) -> ApplyResult:
     payload = joblib.load(model_path)
     rf: RandomForestClassifier = payload["model"]
@@ -521,6 +533,15 @@ def apply_model_with_pixel_sampling(
                 maj = max(counter.items(), key=lambda kv: kv[1])[0]
                 gdf.at[row_idx, "majority"] = str(maj)
 
+    bio_key = (biomass_model or "madagascar").strip().lower()
+    if "plot_area" in gdf.columns:
+        area_m2 = gdf["plot_area"].astype(float)
+    else:
+        area_m2 = gdf.geometry.area.astype(float)
+    area_cm2 = np.maximum(area_m2, 0.0) * 10000.0
+    gdf["plot_area_cm2"] = area_cm2
+    gdf["biomass_g"] = _biomass_from_area_cm2(area_cm2, bio_key)
+
     base_out = Path(output_root)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     folder = base_out / "Output" / f"2-RF/Run_{ts}" if base_out.name.lower() != "output" else base_out / f"2-RF/Run_{ts}"
@@ -528,6 +549,12 @@ def apply_model_with_pixel_sampling(
     keep_cols = []
     if "seg_id" in gdf.columns:
         keep_cols.append("seg_id")
+    if "plot_id" in gdf.columns:
+        keep_cols.append("plot_id")
+    if "plot_area" in gdf.columns:
+        keep_cols.append("plot_area")
+    keep_cols.append("plot_area_cm2")
+    keep_cols.append("biomass_g")
     keep_cols.extend([c for c in cls_to_field.values()])
     keep_cols.append("majority")
     keep_cols = [c for c in keep_cols if c in gdf.columns]
@@ -538,7 +565,13 @@ def apply_model_with_pixel_sampling(
     preview_path: Optional[Path] = None
     if generate_preview and _build_classification_map is not None:
         try:
-            preview_path = _build_classification_map(out_path, raster_path, mode="rf")
+            preview_path = _build_classification_map(
+                out_path,
+                raster_path,
+                mode="rf",
+                aoi_path=aoi_path,
+                biomass_model=bio_key,
+            )
         except Exception:
             preview_path = None
     return ApplyResult(output_path=out_path, duration_sec=time.time() - start, preview_map=preview_path)

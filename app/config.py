@@ -19,6 +19,7 @@ class Session:
     seg_spatialr: int = 5
     seg_minsize: int = 5
     seg_otb_bin: Optional[str] = None
+    biomass_model: str = "madagascar"
 
 
 def save_session(session: Session, location: Path | None = None) -> Path:
@@ -45,4 +46,5 @@ def load_session(location: Path | None = None) -> Optional[Session]:
         seg_spatialr=int(data.get("seg_spatialr", 5)),
         seg_minsize=int(data.get("seg_minsize", 5)),
         seg_otb_bin=data.get("seg_otb_bin"),
+        biomass_model=(data.get("biomass_model") or "madagascar"),
     )

@@ -421,6 +421,7 @@ def run_flet_app() -> None:
                         max_pixels_per_polygon=mpp,
                         progress=cb_apply,
                         generate_preview=True,
+                        biomass_model="madagascar",
                     )
                     page.pubsub.send_all({"kind": "progress", "text": "Workflow complete", "ratio": 1.0})
                     page.pubsub.send_all({"kind": "result", "text": f"Output: {ares.output_path}"})

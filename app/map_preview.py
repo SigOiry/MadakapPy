@@ -1,33 +1,66 @@
 from __future__ import annotations
 
 import base64
-import html
 import io
 import json
 from pathlib import Path
-from typing import Tuple
+from typing import Iterable
 
 import geopandas as gpd
 import numpy as np
-from PIL import Image
 import rasterio
-from rasterio import mask as rio_mask
 from rasterio.warp import transform_bounds
 from shapely.geometry import mapping
-from shapely.ops import unary_union
 
 
-def _band_stats(src: rasterio.io.DatasetReader, geom) -> Tuple[np.ndarray, np.ndarray]:
-    indexes = list(range(1, min(3, src.count) + 1))
-    data, _ = rio_mask(src, [mapping(geom)], indexes=indexes, crop=True, filled=False)
-    data = data.astype("float32")
-    data[(data == 0) | (data == 65535)] = np.nan
-    means = np.array([np.nanmean(band) for band in data], dtype=np.float32)
-    stds = np.array([np.nanstd(band) for band in data], dtype=np.float32)
-    with np.errstate(invalid="ignore"):
-        means /= 65535.0
-        stds /= 65535.0
-    return means, stds
+def _load_raster_overlay(raster_path: Path) -> tuple[str, str]:
+    """Return (bounds_json, base64_png). Always returns something even if raster fails."""
+    fallback_bounds = json.dumps([[-90, -180], [90, 180]])
+    fallback_img = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDAT\x08\xd7c``\x00\x00\x00\x02\x00\x01\xe2!\xbc3\x00\x00\x00\x00IEND\xaeB`\x82").decode(
+        "ascii"
+    )
+    try:
+        with rasterio.open(raster_path) as src:
+            src_crs = src.crs if src.crs else "EPSG:4326"
+            west, south, east, north = transform_bounds(src_crs, "EPSG:4326", *src.bounds, densify_pts=21)
+            max_w = 1600
+            scale = min(1.0, max_w / max(1, src.width))
+            out_h = max(1, int(src.height * scale))
+            out_w = max(1, int(src.width * scale))
+            bands = src.read(out_shape=(src.count, out_h, out_w)).astype("float32")
+            if bands.shape[0] >= 3:
+                rgb = bands[:3]
+            else:
+                rgb = np.repeat(bands[:1], 3, axis=0)
+            img_bands = []
+            for band in rgb:
+                vmin, vmax = float(np.nanpercentile(band, 2)), float(np.nanpercentile(band, 98))
+                vmax = vmin + 1.0 if vmax <= vmin else vmax
+                img_bands.append(np.clip((band - vmin) / (vmax - vmin), 0.0, 1.0))
+            rgb_img = np.transpose((np.stack(img_bands, axis=0) * 255).astype("uint8"), (1, 2, 0))
+            buf = io.BytesIO()
+            from PIL import Image
+
+            Image.fromarray(rgb_img, mode="RGB").save(buf, format="PNG")
+            b64_png = base64.b64encode(buf.getvalue()).decode("ascii")
+        bounds_json = json.dumps([[south, west], [north, east]])
+        return bounds_json, b64_png
+    except Exception:
+        return fallback_bounds, fallback_img
+
+
+def _choose_projected_crs(primary: object | None, secondary: object | None) -> str | object:
+    def _is_projected(c):
+        try:
+            return getattr(c, "is_projected", False)
+        except Exception:
+            return False
+
+    if primary and _is_projected(primary):
+        return primary
+    if secondary and _is_projected(secondary):
+        return secondary
+    return "EPSG:3857"
 
 
 def _normalize(arr: np.ndarray) -> np.ndarray:
@@ -35,220 +68,266 @@ def _normalize(arr: np.ndarray) -> np.ndarray:
     finite = np.isfinite(arr)
     if not finite.any():
         return np.zeros_like(arr)
-    min_v = float(np.nanmin(arr[finite]))
-    max_v = float(np.nanmax(arr[finite]))
-    if max_v - min_v < 1e-8:
+    mn, mx = float(np.nanmin(arr[finite])), float(np.nanmax(arr[finite]))
+    if mx - mn < 1e-8:
         return np.zeros_like(arr)
-    return (arr - min_v) / (max_v - min_v)
+    return (arr - mn) / (mx - mn)
 
 
-def _ensure_brightness_score(gdf: gpd.GeoDataFrame, raster_path: str | Path) -> gpd.GeoDataFrame:
-    def find_col(name: str) -> str | None:
-        for col in gdf.columns:
-            if col.lower() == name.lower():
-                return col
-        return None
-
-    bright_col = find_col("brightness")
-    score_col = find_col("score")
-
-    if bright_col is None or gdf[bright_col].isna().all():
-        brightness = np.zeros(len(gdf), dtype=np.float32)
-        with rasterio.open(raster_path) as src:
-            sample = gdf.to_crs(src.crs) if gdf.crs and str(gdf.crs) != str(src.crs) else gdf
-            for idx, geom in enumerate(sample.geometry):
-                if geom is None or geom.is_empty:
-                    brightness[idx] = np.nan
-                    continue
-                try:
-                    means, _ = _band_stats(src, geom)
-                    brightness[idx] = float(np.nanmean(means)) if np.isfinite(means).any() else np.nan
-                except Exception:
-                    brightness[idx] = np.nan
-        default_bright = (
-            float(np.nanmean(brightness[np.isfinite(brightness)])) if np.isfinite(brightness).any() else 0.0
-        )
-        brightness = np.nan_to_num(brightness, nan=default_bright)
-        gdf["brightness"] = brightness
+def _ensure_brightness_score(gdf: gpd.GeoDataFrame, raster_path: Path) -> gpd.GeoDataFrame:
+    bright_col = next((c for c in gdf.columns if c.lower() == "brightness"), None)
+    score_col = next((c for c in gdf.columns if c.lower() == "score"), None)
+    if bright_col is None:
+        gdf["brightness"] = 0.0
     else:
         gdf["brightness"] = gdf[bright_col].astype(float)
-
-    if score_col is None or gdf[score_col].isna().all():
+    if score_col is None:
         gdf["score"] = 1.0 - _normalize(gdf["brightness"].to_numpy())
     else:
         gdf["score"] = gdf[score_col].astype(float)
     return gdf
 
 
-def _prepare_base_overlay(raster_path: str | Path) -> tuple[str, str]:
-    with rasterio.open(raster_path) as src:
-        west, south, east, north = transform_bounds(src.crs, "EPSG:4326", *src.bounds, densify_pts=21)
-        max_w = 1600
-        scale = min(1.0, max_w / max(1, src.width))
-        out_h = max(1, int(src.height * scale))
-        out_w = max(1, int(src.width * scale))
-        if src.count >= 3:
-            bands = src.read((1, 2, 3), out_shape=(3, out_h, out_w)).astype("float32")
-            img_bands = []
-            for band in bands:
-                vmin, vmax = float(np.nanpercentile(band, 2)), float(np.nanpercentile(band, 98))
-                vmax = vmin + 1.0 if vmax <= vmin else vmax
-                img_bands.append(np.clip((band - vmin) / (vmax - vmin), 0.0, 1.0))
-            rgb = np.transpose((np.stack(img_bands, axis=0) * 255).astype("uint8"), (1, 2, 0))
-            pil = Image.fromarray(rgb, mode="RGB")
-        else:
-            gray = src.read(1, out_shape=(out_h, out_w)).astype("float32")
-            vmin, vmax = float(np.nanpercentile(gray, 2)), float(np.nanpercentile(gray, 98))
-            vmax = vmin + 1.0 if vmax <= vmin else vmax
-            norm = np.clip((gray - vmin) / (vmax - vmin), 0.0, 1.0)
-            pil = Image.fromarray((norm * 255).astype("uint8"), mode="L").convert("RGB")
-        buf = io.BytesIO()
-        pil.save(buf, format="PNG")
-        b64_png = base64.b64encode(buf.getvalue()).decode("ascii")
-    bounds_json = json.dumps([[south, west], [north, east]])
-    return bounds_json, b64_png
-
-
-def build_classification_map(shp_path: str | Path, raster_path: str | Path, mode: str = "stats") -> Path:
-    shp_path = Path(shp_path)
-    raster_path = Path(raster_path)
-    gdf = gpd.read_file(shp_path)
-    gdf = gdf.loc[~gdf.geometry.is_empty].copy()
-    if gdf.empty:
-        raise RuntimeError("Classification output contains no geometries.")
-
-    mode = (mode or "stats").lower()
-    if mode not in {"stats", "rf"}:
-        mode = "stats"
-
+def _ensure_plot_id(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     plot_col = next((c for c in gdf.columns if c.lower() == "plot_id"), None)
     if plot_col is None:
-        gdf["plot_id"] = np.arange(1, len(gdf) + 1)
+        gdf["plot_id"] = np.arange(1, len(gdf) + 1, dtype=np.int64)
     else:
         gdf["plot_id"] = gdf[plot_col]
+    gdf["plot_id"] = gdf["plot_id"].apply(lambda v: str(v))
+    return gdf
 
-    area_col = next(
-        (
-            c
-            for c in gdf.columns
-            if c.lower() in {"seg_area", "plot_area", "plot_area_", "plot_area_m2", "plotarea"}
-        ),
-        None,
-    )
-    areas: np.ndarray | None = None
-    if area_col:
+
+def _areas_by_feature(
+    gdf_main: gpd.GeoDataFrame, aoi: gpd.GeoDataFrame | None, project_crs: object | None
+) -> np.ndarray:
+    if len(gdf_main) == 0:
+        return np.zeros(0, dtype=np.float64)
+    proj_crs = _choose_projected_crs(getattr(gdf_main, "crs", None), getattr(aoi, "crs", None))
+    if project_crs is not None and hasattr(project_crs, "is_projected") and project_crs.is_projected:
+        proj_crs = project_crs
+
+    main = gdf_main
+    try:
+        main = main.to_crs(proj_crs)
+    except Exception:
         try:
-            areas = np.nan_to_num(gdf[area_col].astype(float).to_numpy(), nan=0.0, posinf=0.0, neginf=0.0)
+            main = main.set_crs(proj_crs)
         except Exception:
-            areas = None
-    if areas is None:
-        area_source = gdf
-        if gdf.crs:
+            pass
+
+    aoi_lookup = {}
+    if aoi is not None and len(aoi) > 0 and "plot_id" in aoi.columns:
+        try:
+            aoi_proj = aoi
             try:
-                area_source = gdf.to_crs("EPSG:3857")
+                aoi_proj = aoi_proj.to_crs(proj_crs)
             except Exception:
-                area_source = gdf
-        areas = np.nan_to_num(area_source.geometry.area.to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+                if aoi_proj.crs is None:
+                    aoi_proj = aoi_proj.set_crs(proj_crs)
+            for pid, geom in zip(aoi_proj["plot_id"], aoi_proj.geometry):
+                if geom is not None and not geom.is_empty:
+                    aoi_lookup[str(pid)] = geom
+        except Exception:
+            aoi_lookup = {}
+    if not aoi_lookup:
+        proj_crs = proj_crs
 
-    if gdf.crs and str(gdf.crs) != "EPSG:4326":
-        gdf = gdf.to_crs("EPSG:4326")
+    areas = np.zeros(len(main), dtype=np.float64)
+    for idx, (geom, pid) in enumerate(zip(main.geometry, main["plot_id"])):
+        area_val = 0.0
+        if geom is None or geom.is_empty:
+            areas[idx] = 0.0
+            continue
+        target = aoi_lookup.get(str(pid))
+        try:
+            if target is not None:
+                area_val = float(geom.intersection(target).area)
+            else:
+                area_val = float(geom.area)
+        except Exception:
+            try:
+                area_val = float(geom.area)
+            except Exception:
+                area_val = 0.0
+        areas[idx] = max(0.0, area_val)
+    return areas
 
-    gdf = _ensure_brightness_score(gdf, raster_path)
 
-    class_col = None
-    if mode == "rf":
-        for candidate in ("majority", "majority_", "majclass", "rf_class", "class"):
-            class_col = next((c for c in gdf.columns if c.lower() == candidate), None)
-            if class_col:
-                break
+def _class_column(gdf: gpd.GeoDataFrame) -> str | None:
+    for name in ("majority", "majority_", "majclass", "rf_class", "class"):
+        col = next((c for c in gdf.columns if c.lower() == name), None)
+        if col:
+            return col
+    return None
 
-    features = []
-    score_vals: list[float] = []
-    bright_vals: list[float] = []
-    rf_classes: list[str] = []
-    class_values = gdf[class_col].tolist() if class_col else [None] * len(gdf)
 
-    plot_geoms: dict[str, list] = {}
-    for idx, (geom, score, bright, plot_id, class_value) in enumerate(
-        zip(gdf.geometry, gdf["score"], gdf["brightness"], gdf["plot_id"], class_values)
+def _biomass_from_area(area_m2: float, model: str = "madagascar") -> float:
+    area_m2 = max(0.0, float(area_m2))
+    area_cm2 = area_m2 * 10000.0
+    key = (model or "madagascar").strip().lower()
+    if key == "indonesia":
+        return 0.014 * (area_cm2 ** 1.65)
+    return (-0.0022 * area_cm2 * area_cm2) + (2.3389 * area_cm2) + 29.771
+
+
+def _build_features(
+    gdf: gpd.GeoDataFrame,
+    areas_m2: Iterable[float],
+    mode: str,
+    biomass_model: str,
+) -> tuple[list[dict], dict[str, str]]:
+    features: list[dict] = []
+    palette = [
+        "#0d3b66",
+        "#f95738",
+        "#43aa8b",
+        "#f4d35e",
+        "#577590",
+        "#ff6f59",
+        "#8ac926",
+        "#ffbf69",
+        "#277da1",
+        "#c44536",
+    ]
+    class_colors: dict[str, str] = {}
+
+    cls_col = _class_column(gdf) if mode == "rf" else None
+    biomass_col = next((c for c in gdf.columns if c.lower() == "biomass_g"), None)
+    class_values = gdf[cls_col].tolist() if cls_col else [None] * len(gdf)
+    biomass_vals = gdf[biomass_col].astype(float).tolist() if biomass_col else [None] * len(gdf)
+    classes_seen: list[str] = []
+
+    for geom, pid, score, bright, area_val, cls_val, biomass_val in zip(
+        gdf.geometry, gdf["plot_id"], gdf["score"], gdf["brightness"], areas_m2, class_values, biomass_vals
     ):
         if geom is None or geom.is_empty:
             continue
-        s = float(np.clip(score if np.isfinite(score) else 0.0, 0.0, 1.0))
-        b = float(np.clip(bright if np.isfinite(bright) else 0.0, 0.0, 1.0))
-        score_vals.append(s)
-        bright_vals.append(b)
-        area = float(areas[idx]) if idx < len(areas) else 0.0
-        pid = str(plot_id)
-        plot_geoms.setdefault(pid, []).append(geom)
+        area_clean = float(area_val) if np.isfinite(area_val) else 0.0
+        if biomass_val is not None and np.isfinite(biomass_val):
+            biomass_clean = float(biomass_val)
+        else:
+            biomass_clean = _biomass_from_area(area_clean, biomass_model)
         props = {
-            "score": s,
-            "brightness": b,
-            "plot_id": pid,
-            "seg_area": area,
+            "plot_id": str(pid),
+            "score": float(np.clip(score if np.isfinite(score) else 0.0, 0.0, 1.0)),
+            "brightness": float(np.clip(bright if np.isfinite(bright) else 0.0, 0.0, 1.0)),
+            "area_m2": area_clean,
+            "biomass_g": biomass_clean,
         }
-        if mode == "rf":
-            cls_text = ""
-            if class_value is not None:
-                cls_text = str(class_value).strip()
-            if not cls_text or cls_text.lower() == "nan":
-                cls_text = "Unknown"
+        if cls_col:
+            cls_text = "Unknown" if cls_val is None else str(cls_val).strip() or "Unknown"
             props["rf_class"] = cls_text
-            rf_classes.append(cls_text)
+            classes_seen.append(cls_text)
         features.append({"geometry": geom.__geo_interface__, "properties": props})
 
-    score_min = float(min(score_vals))
-    score_max = float(max(score_vals))
-    bright_min = float(min(bright_vals))
-    bright_max = float(max(bright_vals))
+    if mode == "rf" and cls_col:
+        ordered = list(dict.fromkeys(classes_seen))
+        if not ordered:
+            ordered = ["Unknown"]
+        class_colors = {cls: palette[idx % len(palette)] for idx, cls in enumerate(ordered)}
+        for feat in features:
+            cls = feat["properties"].get("rf_class") or "Unknown"
+            feat["properties"]["rf_class"] = cls
 
-    plot_features = []
-    for pid, geoms in plot_geoms.items():
+    return features, class_colors
+
+
+def build_classification_map(
+    shp_path: str | Path,
+    raster_path: str | Path,
+    mode: str = "stats",
+    aoi_path: str | Path | None = None,
+    biomass_model: str = "madagascar",
+) -> Path:
+    shp_path = Path(shp_path)
+    raster_path = Path(raster_path)
+    aoi_path = Path(aoi_path) if aoi_path else None
+    out_path = shp_path.with_name(f"{shp_path.stem}_map.html")
+
+    try:
+        gdf = gpd.read_file(shp_path)
+        gdf = gdf.loc[~gdf.geometry.is_empty].copy()
+        if gdf.empty:
+            raise RuntimeError("Classification output contains no geometries.")
+
+        raster_crs = None
         try:
-            merged = unary_union(geoms)
+            with rasterio.open(raster_path) as _src:
+                raster_crs = _src.crs
         except Exception:
-            merged = geoms[0]
-            for geom in geoms[1:]:
+            raster_crs = None
+
+        try:
+            if gdf.crs is None and raster_crs:
+                gdf = gdf.set_crs(raster_crs)
+        except Exception:
+            pass
+        try:
+            if gdf.crs and str(gdf.crs) != "EPSG:4326":
+                gdf = gdf.to_crs("EPSG:4326")
+        except Exception:
+            pass
+
+        gdf = _ensure_plot_id(gdf)
+        gdf = _ensure_brightness_score(gdf, raster_path)
+
+        aoi_gdf = None
+        if aoi_path and aoi_path.exists():
+            try:
+                aoi_gdf = gpd.read_file(aoi_path)
+                aoi_gdf = aoi_gdf.loc[~aoi_gdf.geometry.is_empty].copy()
+                if not aoi_gdf.empty:
+                    aoi_gdf = _ensure_plot_id(aoi_gdf)
+                    if aoi_gdf.crs is None and raster_crs is not None:
+                        try:
+                            aoi_gdf = aoi_gdf.set_crs(raster_crs)
+                        except Exception:
+                            pass
+            except Exception:
+                aoi_gdf = None
+
+        areas_m2 = _areas_by_feature(gdf, aoi_gdf, raster_crs)
+
+        bounds_json, b64_png = _load_raster_overlay(raster_path)
+        features, class_colors = _build_features(gdf, areas_m2, mode.lower(), biomass_model)
+
+        aoi_features: list[dict] = []
+        if aoi_gdf is not None and not aoi_gdf.empty:
+            try:
+                aoi_display = aoi_gdf
                 try:
-                    merged = merged.union(geom)
+                    if aoi_display.crs and str(aoi_display.crs) != "EPSG:4326":
+                        aoi_display = aoi_display.to_crs("EPSG:4326")
                 except Exception:
-                    continue
-        if merged is None or merged.is_empty:
-            continue
-        plot_features.append({"geometry": merged.__geo_interface__, "properties": {"plot_id": pid}})
+                    pass
+                for geom, pid in zip(aoi_display.geometry, aoi_display["plot_id"]):
+                    if geom is None or geom.is_empty:
+                        continue
+                    aoi_features.append({"geometry": geom.__geo_interface__, "properties": {"plot_id": str(pid)}})
+            except Exception:
+                aoi_features = []
 
-    bounds_json, b64_png = _prepare_base_overlay(raster_path)
+        score_vals = [f["properties"]["score"] for f in features]
+        bright_vals = [f["properties"]["brightness"] for f in features]
+        score_min = float(min(score_vals)) if score_vals else 0.0
+        score_max = float(max(score_vals)) if score_vals else 1.0
+        bright_min = float(min(bright_vals)) if bright_vals else 0.0
+        bright_max = float(max(bright_vals)) if bright_vals else 1.0
 
-    rf_checkbox_html = ""
-    class_colors: dict[str, str] = {}
-    if mode == "rf":
-        ordered_classes = list(dict.fromkeys(rf_classes))
-        if not ordered_classes:
-            ordered_classes = ["Unknown"]
-        palette = [
-            "#0d3b66",
-            "#f95738",
-            "#43aa8b",
-            "#f4d35e",
-            "#577590",
-            "#ff6f59",
-            "#8ac926",
-            "#ffbf69",
-            "#277da1",
-            "#c44536",
-        ]
-        class_colors = {
-            cls: palette[idx % len(palette)] for idx, cls in enumerate(ordered_classes)
-        }
-        checkbox_items = []
-        for cls in ordered_classes:
-            safe = html.escape(cls, quote=True)
-            checkbox_items.append(
-                f'<label><input type="checkbox" class="class-filter" data-class="{safe}" checked /> {safe}</label>'
-            )
-        rf_checkbox_html = "\n      ".join(checkbox_items)
+        rf_controls = ""
+        if mode.lower() == "rf" and class_colors:
+            checkboxes = []
+            for cls in class_colors:
+                checkboxes.append(
+                    f'<label><input type="checkbox" class="class-filter" data-class="{cls}" checked /> {cls}</label>'
+                )
+            rf_controls = "\n        ".join(checkboxes)
 
-    stats_template = """<!DOCTYPE html>
+        show_class_controls = bool(class_colors)
+        show_score_controls = not show_class_controls
+
+        template = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -265,39 +344,31 @@ def build_classification_map(shp_path: str | Path, raster_path: str | Path, mode
       padding: 12px;
       box-shadow: 0 2px 8px rgba(0,0,0,0.2);
       font-family: "Segoe UI", sans-serif;
-      min-width: 280px;
+      min-width: 260px;
       z-index: 1000;
     }
     .controls label { display: block; margin-bottom: 6px; font-weight: 600; }
-    .controls input[type="range"] { width: 100%; }
-    .controls select, .controls input[type="checkbox"] { width: 100%; padding: 4px; }
-    .stat { font-size: 0.85rem; color: #444; margin-top: 4px; }
+    .controls select { width: 100%; padding: 4px; }
+    .stat { font-size: 0.85rem; color: #444; margin-top: 6px; }
+    .class-list label { font-weight: 400; }
   </style>
 </head>
 <body>
   <div id="map"></div>
   <div class="controls">
-    <label><input type="checkbox" id="togglePolygons" checked /> Show polygons</label>
-    <label>Score threshold: <span id="scoreVal"></span></label>
-    <input type="range" id="scoreSlider" min="0" max="1" step="0.01" />
-    <label>Brightness min: <span id="brightMinVal"></span></label>
-    <input type="range" id="brightSliderMin" min="0" max="1" step="0.01" />
-    <label>Brightness max: <span id="brightMaxVal"></span></label>
-    <input type="range" id="brightSliderMax" min="0" max="1" step="0.01" />
-    <label>Color by:</label>
-    <select id="colorMode">
-      <option value="none">None</option>
-      <option value="brightness">Brightness</option>
-      <option value="score">Score</option>
-    </select>
+    <label><input type="checkbox" id="toggleSegments" checked /> Show segments</label>
+    __SCORE_FILTERS__
+    __COLOR_SECTION__
+    __CLASS_CHECKBOXES__
     <div class="stat" id="countStat"></div>
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    const imageBounds = __IMAGE_BOUNDS__;
-    const imageData = "data:image/png;base64,__IMAGE_DATA__";
+    const imageBounds = __BOUNDS__;
+    const imageData = "data:image/png;base64,__IMAGE__";
     const features = __FEATURES__;
-    const plotFeatures = __PLOT_FEATURES__;
+    const aoiFeatures = __Aoi__;
+    const classColors = __CLASS_COLORS__;
     const scoreMin = __SCORE_MIN__;
     const scoreMax = __SCORE_MAX__;
     const brightMin = __BRIGHT_MIN__;
@@ -307,33 +378,25 @@ def build_classification_map(shp_path: str | Path, raster_path: str | Path, mode
     L.imageOverlay(imageData, imageBounds).addTo(map);
     map.fitBounds(imageBounds);
 
-    const segmentLayer = L.layerGroup().addTo(map);
-    const plotLayer = L.layerGroup().addTo(map);
+    const segPane = map.createPane("segments-pane");
+    segPane.style.zIndex = "450";
+    const aoiPane = map.createPane("aoi-pane");
+    aoiPane.style.zIndex = "650";
+    aoiPane.style.pointerEvents = "auto";
 
-    const toggle = document.getElementById("togglePolygons");
+    const segmentLayer = L.layerGroup().addTo(map);
+    const aoiLayer = L.layerGroup().addTo(map);
+
+    const toggleSegments = document.getElementById("toggleSegments");
+    const colorMode = document.getElementById("colorMode");
     const scoreSlider = document.getElementById("scoreSlider");
-    const brightSliderMin = document.getElementById("brightSliderMin");
-    const brightSliderMax = document.getElementById("brightSliderMax");
+    const brightMinSlider = document.getElementById("brightMin");
+    const brightMaxSlider = document.getElementById("brightMax");
     const scoreLabel = document.getElementById("scoreVal");
     const brightMinLabel = document.getElementById("brightMinVal");
     const brightMaxLabel = document.getElementById("brightMaxVal");
-    const colorMode = document.getElementById("colorMode");
+    const classFilters = Array.from(document.querySelectorAll(".class-filter"));
     const countStat = document.getElementById("countStat");
-
-    scoreSlider.min = scoreMin.toFixed(3);
-    scoreSlider.max = scoreMax.toFixed(3);
-    const defaultScore = Math.max(scoreMin, Math.min(scoreMax, 0.85));
-    scoreSlider.value = defaultScore.toFixed(3);
-    brightSliderMin.min = brightMin.toFixed(3);
-    brightSliderMin.max = brightMax.toFixed(3);
-    const defaultBrightMin = Math.max(brightMin, Math.min(brightMax, 0.0));
-    brightSliderMin.value = defaultBrightMin.toFixed(3);
-    brightSliderMax.min = brightMin.toFixed(3);
-    brightSliderMax.max = brightMax.toFixed(3);
-    const defaultBrightMax = Math.max(defaultBrightMin, Math.min(brightMax, 0.2));
-    brightSliderMax.value = defaultBrightMax.toFixed(3);
-
-    function formatVal(v) { return Number(v).toFixed(2); }
 
     function ramp(val, colors) {
       const v = Math.max(0, Math.min(1, val));
@@ -357,254 +420,187 @@ def build_classification_map(shp_path: str | Path, raster_path: str | Path, mode
       return interp(colors[low], colors[high]);
     }
 
-    function styleFor(props) {
-      const mode = colorMode.value;
-      if (mode === "brightness") {
-        const c = ramp(props.brightness, ["#0d3b66", "#f4d35e", "#ee964b"]);
-        return { color: c, weight: 0, fillColor: c, fillOpacity: 0.55 };
-      }
-      if (mode === "score") {
-        const c = ramp(1 - props.score, ["#022873", "#37b24d", "#fff3bf"]);
-        return { color: c, weight: 0, fillColor: c, fillOpacity: 0.55 };
-      }
-      return { color: "rgba(255,204,0,0.5)", fillColor: "rgba(255,204,0,0.5)", weight: 0, fillOpacity: 0.5 };
-    }
-
-    function render() {
-      segmentLayer.clearLayers();
-      plotLayer.clearLayers();
-      if (!toggle.checked) {
-        countStat.textContent = "Polygons hidden";
-        return;
-      }
-      const scoreThreshold = Number(scoreSlider.value);
-      const brightMinThreshold = Number(brightSliderMin.value);
-      const brightMaxThreshold = Number(brightSliderMax.value);
-      const filtered = [];
-      features.forEach(f => {
-        const props = f.properties;
-        if (props.score < scoreThreshold) return;
-        if (props.brightness < brightMinThreshold) return;
-        if (props.brightness > brightMaxThreshold) return;
-        filtered.push(f);
-      });
-      const plotAreas = {};
-      filtered.forEach(f => {
-        const pid = f.properties.plot_id || "plot";
-        plotAreas[pid] = (plotAreas[pid] || 0) + (f.properties.seg_area || 0);
-      });
-      filtered.forEach(f => {
-        const props = f.properties;
-        const pid = props.plot_id || "plot";
-        const plotArea = plotAreas[pid] || 0;
-        L.geoJSON(f.geometry, {
-          style: () => styleFor(props),
-          onEachFeature: (_feature, lyr) => {
-            lyr.bindTooltip(`Plot ${pid} selected area: ${plotArea.toFixed(2)} m^2`, { sticky: true });
-          },
-        }).addTo(segmentLayer);
-      });
-      const totalArea = Object.values(plotAreas).reduce((sum, val) => sum + val, 0);
-      plotFeatures.forEach(f => {
-        const pid = f.properties.plot_id || "plot";
-        const plotArea = plotAreas[pid] || 0;
-        L.geoJSON(f.geometry, {
-          style: () => ({ color: "#000000", opacity: 0, fillOpacity: 0, weight: 0 }),
-          onEachFeature: (_feature, lyr) => {
-            lyr.bindTooltip(`Plot ${pid} total selected area: ${plotArea.toFixed(2)} m^2`, { sticky: true });
-          },
-        }).addTo(plotLayer);
-      });
-      countStat.textContent = `${filtered.length} polygon(s) | Total area: ${totalArea.toFixed(2)} m^2 (score >= ${formatVal(scoreSlider.value)}, brightness ${formatVal(brightSliderMin.value)}-${formatVal(brightSliderMax.value)})`;
-    }
-
-    function refreshLabels() {
-      scoreLabel.textContent = formatVal(scoreSlider.value);
-      brightMinLabel.textContent = formatVal(brightSliderMin.value);
-      brightMaxLabel.textContent = formatVal(brightSliderMax.value);
-    }
-
-    function handleBrightnessInput(changed) {
-      const minVal = Number(brightSliderMin.value);
-      const maxVal = Number(brightSliderMax.value);
-      if (minVal > maxVal) {
-        if (changed === "min") {
-          brightSliderMax.value = brightSliderMin.value;
-        } else {
-          brightSliderMin.value = brightSliderMax.value;
-        }
-      }
-      refreshLabels();
-      render();
-    }
-
-    toggle.addEventListener("change", render);
-    scoreSlider.addEventListener("input", () => { refreshLabels(); render(); });
-    brightSliderMin.addEventListener("input", () => handleBrightnessInput("min"));
-    brightSliderMax.addEventListener("input", () => handleBrightnessInput("max"));
-    colorMode.addEventListener("change", render);
-
-    refreshLabels();
-    render();
-  </script>
-</body>
-</html>"""
-
-    rf_template = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Classification Preview</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <style>
-    html, body, #map { width: 100%; height: 100%; margin: 0; padding: 0; }
-    .controls {
-      position: absolute;
-      top: 12px;
-      right: 12px;
-      background: rgba(255,255,255,0.95);
-      border-radius: 10px;
-      padding: 12px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-      font-family: "Segoe UI", sans-serif;
-      min-width: 280px;
-      z-index: 1000;
-      max-height: 80vh;
-      overflow-y: auto;
-    }
-    .controls label { display: block; margin-bottom: 6px; font-weight: 600; }
-    .class-list {
-      margin-top: 8px;
-      border: 1px solid #e5e5e5;
-      border-radius: 6px;
-      padding: 8px;
-      background: #fafafa;
-    }
-    .class-list strong {
-      display: block;
-      margin-bottom: 6px;
-      font-size: 0.9rem;
-    }
-    .class-list label {
-      font-weight: 400;
-      margin-bottom: 4px;
-    }
-    .stat { font-size: 0.85rem; color: #444; margin-top: 8px; }
-  </style>
-</head>
-<body>
-  <div id="map"></div>
-  <div class="controls">
-    <label><input type="checkbox" id="togglePolygons" checked /> Show polygons</label>
-    <div class="class-list">
-      <strong>Classes</strong>
-      __CLASS_CHECKBOXES__
-    </div>
-    <div class="stat" id="countStat"></div>
-  </div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    const imageBounds = __IMAGE_BOUNDS__;
-    const imageData = "data:image/png;base64,__IMAGE_DATA__";
-    const features = __FEATURES__;
-    const classColors = __CLASS_COLORS__;
-    const plotFeatures = __PLOT_FEATURES__;
-
-    const map = L.map('map', { maxZoom: 22 });
-    L.imageOverlay(imageData, imageBounds).addTo(map);
-    map.fitBounds(imageBounds);
-
-    const segmentLayer = L.layerGroup().addTo(map);
-    const plotLayer = L.layerGroup().addTo(map);
-    const toggle = document.getElementById("togglePolygons");
-    const countStat = document.getElementById("countStat");
-    const classFilters = Array.from(document.querySelectorAll(".class-filter"));
-
-    function styleFor(cls) {
-      const color = classColors[cls] || "#ffcc00";
-      return { color, fillColor: color, fillOpacity: 0.55, weight: 0 };
+    function colorFor(props) {
+      const mode = colorMode ? colorMode.value : (props.rf_class ? "class" : "none");
+      if (mode === "brightness") return ramp(props.brightness, ["#0d3b66", "#f4d35e", "#ee964b"]);
+      if (mode === "score") return ramp(1 - props.score, ["#022873", "#37b24d", "#fff3bf"]);
+      if (mode === "class" && props.rf_class) return classColors[props.rf_class] || "#ffcc00";
+      return "rgba(255,204,0,0.6)";
     }
 
     function activeClasses() {
       const allowed = new Set();
-      classFilters.forEach(cb => {
-        if (cb.checked) allowed.add(cb.dataset.class);
-      });
+      classFilters.forEach(cb => { if (cb.checked) allowed.add(cb.dataset.class); });
       return allowed;
     }
 
-    function render() {
-      segmentLayer.clearLayers();
-      plotLayer.clearLayers();
-      if (!toggle.checked) {
-        countStat.textContent = "Polygons hidden";
-        return;
-      }
-      const allowed = activeClasses();
-      if (!allowed.size) {
-        countStat.textContent = "Select at least one class";
-        return;
-      }
-      const filtered = [];
-      features.forEach(f => {
-        const cls = f.properties.rf_class || "Unknown";
-        if (!allowed.has(cls)) return;
-        filtered.push(f);
-      });
-      const plotAreas = {};
-      filtered.forEach(f => {
-        const pid = f.properties.plot_id || "plot";
-        plotAreas[pid] = (plotAreas[pid] || 0) + (f.properties.seg_area || 0);
-      });
-      filtered.forEach(f => {
-        const props = f.properties;
+    function computeAggregates(items) {
+      const totals = {};
+      items.forEach(f => {
+        const props = f.properties || {};
         const pid = props.plot_id || "plot";
-        const plotArea = plotAreas[pid] || 0;
-        const cls = props.rf_class || "Unknown";
+        const a = Number(props.area_m2 || 0);
+        const bio = Number(props.biomass_g || 0);
+        if (!totals[pid]) totals[pid] = { area: 0, biomass: 0 };
+        if (isFinite(a) && a > 0) totals[pid].area += a;
+        if (isFinite(bio) && bio > 0) totals[pid].biomass += bio;
+      });
+      return totals;
+    }
+
+    let currentPlotStats = computeAggregates(features);
+    function refreshLabels() {
+      if (scoreLabel) scoreLabel.textContent = Number(scoreSlider.value).toFixed(2);
+      if (brightMinLabel) brightMinLabel.textContent = Number(brightMinSlider.value).toFixed(2);
+      if (brightMaxLabel) brightMaxLabel.textContent = Number(brightMaxSlider.value).toFixed(2);
+    }
+
+    function syncDefaults() {
+      if (scoreSlider) scoreSlider.value = scoreMin;
+      if (brightMinSlider) brightMinSlider.value = brightMin;
+      if (brightMaxSlider) brightMaxSlider.value = brightMax;
+      toggleSegments.checked = true;
+      refreshLabels();
+    }
+    syncDefaults();
+
+    function renderSegments() {
+      segmentLayer.clearLayers();
+      if (!toggleSegments.checked) {
+        currentPlotStats = {};
+        countStat.textContent = "Segments hidden";
+        aoiLayer.bringToFront();
+        return;
+      }
+      let itemsFiltered = features.slice();
+      if (scoreSlider && brightMinSlider && brightMaxSlider) {
+        const scoreCut = Number(scoreSlider.value);
+        const bMin = Number(brightMinSlider.value);
+        let bMax = Number(brightMaxSlider.value);
+        if (bMin > bMax) {
+          bMax = bMin;
+          brightMaxSlider.value = bMax;
+        }
+        itemsFiltered = [];
+        features.forEach(f => {
+          const p = f.properties || {};
+          if (p.score < scoreCut) return;
+          if (p.brightness < bMin) return;
+          if (p.brightness > bMax) return;
+          itemsFiltered.push(f);
+        });
+      }
+      let items = itemsFiltered;
+      if (classFilters.length > 0) {
+        const allowed = activeClasses();
+        items = items.filter(f => allowed.has((f.properties && f.properties.rf_class) || "Unknown"));
+      }
+      currentPlotStats = computeAggregates(items);
+      items.forEach(f => {
+        const props = f.properties;
         L.geoJSON(f.geometry, {
-          style: () => styleFor(cls),
-          onEachFeature: (_feature, lyr) => {
-            lyr.bindTooltip(`Plot ${pid} selected area: ${plotArea.toFixed(2)} m^2 (class: ${cls})`, { sticky: true });
+          pane: "segments-pane",
+          style: () => {
+            const color = colorFor(props);
+            return { color, fillColor: color, fillOpacity: 0.55, weight: 0 };
           },
         }).addTo(segmentLayer);
       });
-      const totalArea = Object.values(plotAreas).reduce((sum, val) => sum + val, 0);
-      plotFeatures.forEach(f => {
-        const pid = f.properties.plot_id || "plot";
-        const plotArea = plotAreas[pid] || 0;
-        L.geoJSON(f.geometry, {
-          style: () => ({ color: "#000000", opacity: 0, fillOpacity: 0, weight: 0 }),
-          onEachFeature: (_feature, lyr) => {
-            lyr.bindTooltip(`Plot ${pid} total selected area: ${plotArea.toFixed(2)} m^2`, { sticky: true });
-          },
-        }).addTo(plotLayer);
-      });
-      countStat.textContent = `${filtered.length} polygon(s) | Total area: ${totalArea.toFixed(2)} m^2 | Classes: ${Array.from(allowed).join(", ")}`;
+      countStat.textContent = `${items.length} segment(s)`;
+      aoiLayer.bringToFront();
     }
 
-    toggle.addEventListener("change", render);
-    classFilters.forEach(cb => cb.addEventListener("change", render));
+    function buildAoiLayer() {
+      aoiLayer.clearLayers();
+      if (!aoiFeatures || !aoiFeatures.length) return;
+      aoiFeatures.forEach(f => {
+        const pid = (f.properties && f.properties.plot_id) || "plot";
+        L.geoJSON(f.geometry, {
+          pane: "aoi-pane",
+          interactive: true,
+          bubblingMouseEvents: false,
+          style: () => ({
+            color: "#ff6600",
+            weight: 2.5,
+            opacity: 0.35,
+            fillColor: "#ff6600",
+            fillOpacity: 0.0,
+          }),
+          onEachFeature: (_feature, lyr) => {
+            lyr.on("mouseover", () => {
+              const stats = currentPlotStats[pid] || { area: 0, biomass: 0 };
+              const tons = (stats.biomass || 0) / 1000.0;
+              const text = `Plot ${pid}: ${stats.area.toLocaleString(undefined, {maximumFractionDigits: 2})} m^2 | Biomass: ${tons.toLocaleString(undefined, {maximumFractionDigits: 2})} t`;
+              lyr.bindTooltip(text, { sticky: true }).openTooltip();
+            });
+            lyr.on("mouseout", () => lyr.closeTooltip());
+          },
+        }).addTo(aoiLayer);
+      });
+      aoiLayer.bringToFront();
+    }
 
-    render();
+    toggleSegments.checked = true;
+    toggleSegments.addEventListener("change", renderSegments);
+    if (colorMode) colorMode.addEventListener("change", renderSegments);
+    classFilters.forEach(cb => cb.addEventListener("change", renderSegments));
+    if (scoreSlider) scoreSlider.addEventListener("input", () => { refreshLabels(); renderSegments(); });
+    if (brightMinSlider) brightMinSlider.addEventListener("input", () => { refreshLabels(); renderSegments(); });
+    if (brightMaxSlider) brightMaxSlider.addEventListener("input", () => { refreshLabels(); renderSegments(); });
+
+    buildAoiLayer();
+    renderSegments();
   </script>
 </body>
 </html>"""
 
-    template = rf_template if mode == "rf" else stats_template
+        html_body = (
+            template.replace("__BOUNDS__", bounds_json)
+            .replace("__IMAGE__", b64_png)
+            .replace("__FEATURES__", json.dumps(features))
+            .replace("__Aoi__", json.dumps(aoi_features))
+            .replace("__CLASS_COLORS__", json.dumps(class_colors))
+            .replace(
+                "__CLASS_CHECKBOXES__",
+                ("<div class='class-list'>" + rf_controls + "</div>") if show_class_controls else "",
+            )
+            .replace(
+                "__SCORE_FILTERS__",
+                (
+                    """
+    <label>Score >= <span id="scoreVal"></span></label>
+    <input type="range" id="scoreSlider" min="__SCORE_MIN__" max="__SCORE_MAX__" step="0.01" />
+    <label>Brightness <span id="brightMinVal"></span> - <span id="brightMaxVal"></span></label>
+    <input type="range" id="brightMin" min="__BRIGHT_MIN__" max="__BRIGHT_MAX__" step="0.01" />
+    <input type="range" id="brightMax" min="__BRIGHT_MIN__" max="__BRIGHT_MAX__" step="0.01" />
+    """
+                )
+                if show_score_controls
+                else "",
+            )
+            .replace(
+                "__COLOR_SECTION__",
+                """
+    <label>Color by:</label>
+    <select id="colorMode">
+      <option value="none">None</option>
+      <option value="brightness">Brightness</option>
+      <option value="score">Score</option>
+    </select>
+    """
+                if show_score_controls
+                else "",
+            )
+            .replace("__SCORE_MIN__", f"{score_min:.4f}")
+            .replace("__SCORE_MAX__", f"{score_max:.4f}")
+            .replace("__BRIGHT_MIN__", f"{bright_min:.4f}")
+            .replace("__BRIGHT_MAX__", f"{bright_max:.4f}")
+        )
 
-    html_content = template
-    html_content = html_content.replace("__IMAGE_BOUNDS__", bounds_json)
-    html_content = html_content.replace("__IMAGE_DATA__", b64_png)
-    html_content = html_content.replace("__FEATURES__", json.dumps(features))
-    html_content = html_content.replace("__PLOT_FEATURES__", json.dumps(plot_features))
-    html_content = html_content.replace("__SCORE_MIN__", f"{score_min:.6f}")
-    html_content = html_content.replace("__SCORE_MAX__", f"{score_max:.6f}")
-    html_content = html_content.replace("__BRIGHT_MIN__", f"{bright_min:.6f}")
-    html_content = html_content.replace("__BRIGHT_MAX__", f"{bright_max:.6f}")
-    if mode == "rf":
-        html_content = html_content.replace("__CLASS_CHECKBOXES__", rf_checkbox_html)
-        html_content = html_content.replace("__CLASS_COLORS__", json.dumps(class_colors))
-
-    out_path = shp_path.with_name(f"{shp_path.stem}_map.html")
-    out_path.write_text(html_content, encoding="utf-8")
-    return out_path
+        out_path.write_text(html_body, encoding="utf-8")
+        return out_path
+    except Exception as exc:  # write minimal error page
+        msg = f"Failed to render preview: {exc}"
+        fallback = f"<html><body><pre>{msg}</pre></body></html>"
+        out_path.write_text(fallback, encoding="utf-8")
+        return out_path

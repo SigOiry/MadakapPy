@@ -52,7 +52,7 @@ def _ranger_from_band1(src: rasterio.io.DatasetReader, window: rasterio.windows.
     band1 = src.read(1, window=window, masked=True)
     arr = band1.astype("float32")
     arr[(arr == 0) | (arr == 65535)] = np.nan
-    ranger = float(np.nanstd(arr))
+    ranger = float(np.nanstd(arr)) * 0.5
     if not np.isfinite(ranger) or ranger == 0:
         ranger = 1.0
     return ranger

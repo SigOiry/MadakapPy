@@ -52,10 +52,21 @@ def _band_stats(
     return means, stds
 
 
+def _biomass_from_area_cm2(area_cm2: np.ndarray | float, model: str) -> np.ndarray:
+    arr = np.asarray(area_cm2, dtype=np.float64)
+    arr = np.maximum(arr, 0.0)
+    model_key = (model or "madagascar").strip().lower()
+    if model_key == "indonesia":
+        with np.errstate(invalid="ignore"):
+            return 0.014 * np.power(arr, 1.65)
+    return (-0.0022 * arr * arr) + (2.3389 * arr) + 29.771
+
+
 def classify_dark_linear_polygons(
     raster_path: str | Path,
     segments_path: str | Path,
     output_root: str | Path,
+    biomass_model: str = "madagascar",
     progress: Optional[Progress] = None,
 ) -> SimpleClassifyResult:
     """
@@ -210,6 +221,10 @@ def classify_dark_linear_polygons(
     gdf["score"] = np.nan_to_num(1.0 - norm_brightness, nan=0.0)
     gdf["cluster_id"] = np.where(selected, 1, 0)
     gdf["selected"] = selected
+
+    area_cm2 = np.asarray(gdf.geometry.area, dtype=np.float64) * 10000.0
+    gdf["plot_area_cm2"] = area_cm2
+    gdf["biomass_g"] = _biomass_from_area_cm2(area_cm2, biomass_model)
 
     if seg_crs:
         gdf = gdf.to_crs(seg_crs)
