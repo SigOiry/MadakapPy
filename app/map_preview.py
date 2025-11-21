@@ -356,7 +356,7 @@ def build_classification_map(
 <body>
   <div id="map"></div>
   <div class="controls">
-    <label><input type="checkbox" id="toggleSegments" checked /> Show segments</label>
+    <label><input type="checkbox" id="toggleSegments" /> Show segments</label>
     __SCORE_FILTERS__
     __COLOR_SECTION__
     __CLASS_CHECKBOXES__
@@ -459,7 +459,7 @@ def build_classification_map(
       if (scoreSlider) scoreSlider.value = scoreMin;
       if (brightMinSlider) brightMinSlider.value = brightMin;
       if (brightMaxSlider) brightMaxSlider.value = brightMax;
-      toggleSegments.checked = true;
+      toggleSegments.checked = false;
       refreshLabels();
     }
     syncDefaults();
@@ -530,7 +530,7 @@ def build_classification_map(
             lyr.on("mouseover", () => {
               const stats = currentPlotStats[pid] || { area: 0, biomass: 0 };
               const tons = (stats.biomass || 0) / 1000.0;
-              const text = `Plot ${pid}: ${stats.area.toLocaleString(undefined, {maximumFractionDigits: 2})} m^2 | Biomass: ${tons.toLocaleString(undefined, {maximumFractionDigits: 2})} t`;
+              const text = `Plot ${pid}: ${stats.area.toLocaleString(undefined, {maximumFractionDigits: 2})} m^2 | Biomass: ${tons.toLocaleString(undefined, {maximumFractionDigits: 2})} kg`;
               lyr.bindTooltip(text, { sticky: true }).openTooltip();
             });
             lyr.on("mouseout", () => lyr.closeTooltip());
@@ -540,7 +540,6 @@ def build_classification_map(
       aoiLayer.bringToFront();
     }
 
-    toggleSegments.checked = true;
     toggleSegments.addEventListener("change", renderSegments);
     if (colorMode) colorMode.addEventListener("change", renderSegments);
     classFilters.forEach(cb => cb.addEventListener("change", renderSegments));

@@ -58,6 +58,65 @@ def _model_dir(base_out: Path) -> Path:
     return base_out / "Model"
 
 
+def _linear_unit_to_m(crs) -> float:
+    try:
+        axis_info = getattr(crs, "axis_info", None)
+        if axis_info:
+            axis = axis_info[0]
+            factor = getattr(axis, "unit_conversion_factor", None)
+            if factor and factor > 0:
+                return float(factor)
+            unit_name = (getattr(axis, "unit_name", "") or "").lower()
+            if "metre" in unit_name or "meter" in unit_name:
+                return 1.0
+            if "foot" in unit_name:
+                return 0.3048006096012192
+    except Exception:
+        pass
+    return 1.0
+
+
+def _metric_crs_for_area(gdf: gpd.GeoDataFrame):
+    try:
+        utm_guess = gdf.estimate_utm_crs()
+        if utm_guess is not None:
+            return utm_guess
+    except Exception:
+        pass
+    return "EPSG:6933"
+
+
+def _area_m2_from_values(gdf: gpd.GeoDataFrame, values: Optional[Sequence[float]] = None) -> np.ndarray:
+    if len(gdf) == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    base_vals = np.asarray(values if values is not None else gdf.geometry.area, dtype=np.float64)
+    base_vals = np.nan_to_num(base_vals, nan=0.0, posinf=0.0, neginf=0.0)
+
+    crs_obj = getattr(gdf, "crs", None)
+    if crs_obj is None:
+        return np.maximum(base_vals, 0.0)
+
+    try:
+        if getattr(crs_obj, "is_geographic", False):
+            metric_crs = _metric_crs_for_area(gdf)
+            metric_area = gdf.geometry.to_crs(metric_crs).area.astype(float)
+            metric_area = np.nan_to_num(metric_area, nan=0.0, posinf=0.0, neginf=0.0)
+            if values is None:
+                return np.maximum(metric_area, 0.0)
+            orig_area = np.asarray(gdf.geometry.area, dtype=np.float64)
+            denom = np.where(np.abs(orig_area) < 1e-12, np.nan, orig_area)
+            ratio = np.divide(metric_area, denom, out=np.zeros_like(metric_area), where=np.isfinite(denom))
+            ratio = np.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
+            converted = np.maximum(base_vals, 0.0) * ratio
+            return converted
+
+        unit_factor = _linear_unit_to_m(crs_obj)
+        return np.maximum(base_vals, 0.0) * (unit_factor ** 2)
+    except Exception:
+        return np.maximum(base_vals, 0.0)
+
+
 def _biomass_from_area_cm2(area_cm2: np.ndarray | float, model: str) -> np.ndarray:
     arr = np.asarray(area_cm2, dtype=np.float64)
     arr = np.maximum(arr, 0.0)
@@ -65,7 +124,7 @@ def _biomass_from_area_cm2(area_cm2: np.ndarray | float, model: str) -> np.ndarr
     if model_key == "indonesia":
         with np.errstate(invalid="ignore"):
             return 0.014 * np.power(arr, 1.65)
-    return (-0.0022 * arr * arr) + (2.3389 * arr) + 29.771
+    return (0.5621 * arr)
 
 
 def _rf_features_for_polygon(src: rasterio.io.DatasetReader, geom) -> np.ndarray:
@@ -534,10 +593,8 @@ def apply_model_with_pixel_sampling(
                 gdf.at[row_idx, "majority"] = str(maj)
 
     bio_key = (biomass_model or "madagascar").strip().lower()
-    if "plot_area" in gdf.columns:
-        area_m2 = gdf["plot_area"].astype(float)
-    else:
-        area_m2 = gdf.geometry.area.astype(float)
+    raw_area = gdf["plot_area"].astype(float) if "plot_area" in gdf.columns else None
+    area_m2 = _area_m2_from_values(gdf, raw_area)
     area_cm2 = np.maximum(area_m2, 0.0) * 10000.0
     gdf["plot_area_cm2"] = area_cm2
     gdf["biomass_g"] = _biomass_from_area_cm2(area_cm2, bio_key)

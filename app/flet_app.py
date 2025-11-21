@@ -45,6 +45,53 @@ def run_flet_app() -> None:
             "muted":   "#6E7A8A",
         }
 
+    def _resolve_window_icon() -> str | None:
+        """Return an absolute path to the best icon for the current platform."""
+        project_root = Path(__file__).resolve().parent.parent
+        icon_dir = project_root / "icon"
+        png_path = icon_dir / "madakappy.png"
+        ico_path = icon_dir / "madakappy.ico"
+
+        target: Path | None = None
+        # Windows expects a .ico to update Explorer/taskbar thumbnails.
+        if os.name == "nt":
+            png_exists = png_path.exists()
+            ico_exists = ico_path.exists()
+            needs_refresh = False
+            if png_exists and ico_exists:
+                try:
+                    needs_refresh = png_path.stat().st_mtime > ico_path.stat().st_mtime
+                except OSError:
+                    needs_refresh = True
+            elif png_exists:
+                needs_refresh = True
+
+            if png_exists and needs_refresh:
+                try:
+                    sizes = [(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)]
+                    with Image.open(png_path) as img:
+                        img.convert("RGBA").save(ico_path, format="ICO", sizes=sizes)
+                    ico_exists = True
+                except Exception:
+                    target = png_path
+
+            if ico_exists:
+                target = ico_path
+            elif png_exists and target is None:
+                target = png_path
+        else:
+            if png_path.exists():
+                target = png_path
+            elif ico_path.exists():
+                target = ico_path
+
+        if target is not None:
+            try:
+                return str(target.resolve())
+            except OSError:
+                return str(target)
+        return None
+
     if not hasattr(ft, "ExpansionTile"):
         class _CompatExpansionTile(ft.UserControl):
             def __init__(
@@ -512,9 +559,9 @@ def run_flet_app() -> None:
         except Exception:
             pass
         try:
-            icon_file = Path("icon") / "madakappy.png"
-            if icon_file.exists():
-                page.window_icon_path = str(icon_file.resolve())
+            icon_path = _resolve_window_icon()
+            if icon_path:
+                page.window_icon_path = icon_path
         except Exception:
             pass
         page.window_maximized = True
@@ -1328,7 +1375,7 @@ def run_flet_app() -> None:
         biomass_model = ft.Dropdown(
             value="madagascar",
             options=[
-                ft.dropdown.Option(key="madagascar", text="Madagascar (poly)"),
+                ft.dropdown.Option(key="madagascar", text="Madagascar (linear)"),
                 ft.dropdown.Option(key="indonesia", text="Indonesia (power)"),
             ],
             width=220,
