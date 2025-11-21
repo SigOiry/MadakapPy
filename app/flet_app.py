@@ -1375,8 +1375,8 @@ def run_flet_app() -> None:
         biomass_model = ft.Dropdown(
             value="madagascar",
             options=[
-                ft.dropdown.Option(key="madagascar", text="Madagascar (linear)"),
-                ft.dropdown.Option(key="indonesia", text="Indonesia (power)"),
+                ft.dropdown.Option(key="madagascar", text="Madagascar (linear forced to 0)"),
+                ft.dropdown.Option(key="indonesia", text="Indonesia (Nurdin et al. 2023)"),
             ],
             width=220,
         )

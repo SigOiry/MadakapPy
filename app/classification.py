@@ -5,12 +5,13 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from collections import Counter, defaultdict
 
 import joblib
 import numpy as np
 import geopandas as gpd
+import pandas as pd
 import rasterio
 from rasterio import features as rio_features
 from rasterio.mask import mask as rio_mask
@@ -58,65 +59,6 @@ def _model_dir(base_out: Path) -> Path:
     return base_out / "Model"
 
 
-def _linear_unit_to_m(crs) -> float:
-    try:
-        axis_info = getattr(crs, "axis_info", None)
-        if axis_info:
-            axis = axis_info[0]
-            factor = getattr(axis, "unit_conversion_factor", None)
-            if factor and factor > 0:
-                return float(factor)
-            unit_name = (getattr(axis, "unit_name", "") or "").lower()
-            if "metre" in unit_name or "meter" in unit_name:
-                return 1.0
-            if "foot" in unit_name:
-                return 0.3048006096012192
-    except Exception:
-        pass
-    return 1.0
-
-
-def _metric_crs_for_area(gdf: gpd.GeoDataFrame):
-    try:
-        utm_guess = gdf.estimate_utm_crs()
-        if utm_guess is not None:
-            return utm_guess
-    except Exception:
-        pass
-    return "EPSG:6933"
-
-
-def _area_m2_from_values(gdf: gpd.GeoDataFrame, values: Optional[Sequence[float]] = None) -> np.ndarray:
-    if len(gdf) == 0:
-        return np.zeros(0, dtype=np.float64)
-
-    base_vals = np.asarray(values if values is not None else gdf.geometry.area, dtype=np.float64)
-    base_vals = np.nan_to_num(base_vals, nan=0.0, posinf=0.0, neginf=0.0)
-
-    crs_obj = getattr(gdf, "crs", None)
-    if crs_obj is None:
-        return np.maximum(base_vals, 0.0)
-
-    try:
-        if getattr(crs_obj, "is_geographic", False):
-            metric_crs = _metric_crs_for_area(gdf)
-            metric_area = gdf.geometry.to_crs(metric_crs).area.astype(float)
-            metric_area = np.nan_to_num(metric_area, nan=0.0, posinf=0.0, neginf=0.0)
-            if values is None:
-                return np.maximum(metric_area, 0.0)
-            orig_area = np.asarray(gdf.geometry.area, dtype=np.float64)
-            denom = np.where(np.abs(orig_area) < 1e-12, np.nan, orig_area)
-            ratio = np.divide(metric_area, denom, out=np.zeros_like(metric_area), where=np.isfinite(denom))
-            ratio = np.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
-            converted = np.maximum(base_vals, 0.0) * ratio
-            return converted
-
-        unit_factor = _linear_unit_to_m(crs_obj)
-        return np.maximum(base_vals, 0.0) * (unit_factor ** 2)
-    except Exception:
-        return np.maximum(base_vals, 0.0)
-
-
 def _biomass_from_area_cm2(area_cm2: np.ndarray | float, model: str) -> np.ndarray:
     arr = np.asarray(area_cm2, dtype=np.float64)
     arr = np.maximum(arr, 0.0)
@@ -125,6 +67,85 @@ def _biomass_from_area_cm2(area_cm2: np.ndarray | float, model: str) -> np.ndarr
         with np.errstate(invalid="ignore"):
             return 0.014 * np.power(arr, 1.65)
     return (0.5621 * arr)
+
+def _merge_segments_by_majority(gdf: gpd.GeoDataFrame, cls_to_field: dict[str, str]) -> gpd.GeoDataFrame:
+    if "majority" not in gdf.columns:
+        return gdf
+
+    valid = gdf.loc[gdf["majority"].notna()].copy()
+    if valid.empty:
+        return gdf
+
+    group_fields: list[str] = []
+    if "plot_id" in valid.columns:
+        valid["plot_id"] = valid["plot_id"].astype(str).fillna("plot")
+        group_fields.append("plot_id")
+    group_fields.append("majority")
+
+    agg_map: dict[str, str] = {}
+    for fld in cls_to_field.values():
+        if fld in valid.columns:
+            agg_map[fld] = "mean"
+    if "pixel_count" in valid.columns:
+        agg_map["pixel_count"] = "sum"
+    if "n_samp" in valid.columns:
+        agg_map["n_samp"] = "sum"
+
+    records: list[dict[str, Any]] = []
+    grouped = valid.groupby(group_fields, dropna=False)
+    for keys, frame in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row: dict[str, Any] = {}
+        for idx, field in enumerate(group_fields):
+            row[field] = keys[idx]
+        for fld, method in agg_map.items():
+            data = frame[fld].astype(float)
+            if method == "mean":
+                row[fld] = float(data.mean()) if len(data) else 0.0
+            else:
+                row[fld] = float(data.sum()) if len(data) else 0.0
+        row["geometry"] = frame.geometry.unary_union
+        records.append(row)
+
+    if not records:
+        merged = valid.copy()
+    else:
+        merged = gpd.GeoDataFrame(records, geometry="geometry", crs=gdf.crs)
+
+    remainder = gdf.loc[gdf["majority"].isna()].copy()
+    if not remainder.empty:
+        merged = pd.concat([merged, remainder], ignore_index=True)
+        merged = gpd.GeoDataFrame(merged, geometry="geometry", crs=gdf.crs)
+
+    merged = merged.reset_index(drop=True)
+    merged["seg_id"] = np.arange(1, len(merged) + 1, dtype=np.int64)
+    if "n_samp" in merged.columns:
+        merged["n_samp"] = merged["n_samp"].round().astype(int)
+    if "pixel_count" in merged.columns:
+        merged["pixel_count"] = merged["pixel_count"].round().astype(int)
+    return merged
+
+
+def _pixel_area_from_dataset(src: rasterio.io.DatasetReader) -> float:
+    try:
+        res_x, res_y = src.res
+        val = abs(float(res_x) * float(res_y))
+        if val > 0:
+            return val
+    except Exception:
+        pass
+    try:
+        transform = getattr(src, "transform", None)
+        if transform is not None:
+            res_x = abs(float(getattr(transform, "a", 0.0)))
+            res_y = abs(float(getattr(transform, "e", 0.0)))
+            val = res_x * res_y
+            if val > 0:
+                return val
+    except Exception:
+        pass
+    return 1.0
 
 
 def _rf_features_for_polygon(src: rasterio.io.DatasetReader, geom) -> np.ndarray:
@@ -470,6 +491,7 @@ def apply_model_with_pixel_sampling(
         gdf["n_samp"] = 0
     if "majority" not in gdf.columns:
         gdf["majority"] = None
+    gdf["pixel_count"] = 0
 
     try:
         cap = int(max_pixels_per_polygon)
@@ -479,6 +501,7 @@ def apply_model_with_pixel_sampling(
         cap = 1
 
     start = time.time()
+    pixel_area_m2 = 1.0
     with rasterio.open(raster_path) as src:
         # Reproject segments to raster CRS if needed
         try:
@@ -486,7 +509,10 @@ def apply_model_with_pixel_sampling(
                 gdf = gdf.to_crs(src.crs)
         except Exception:
             pass
-
+        try:
+            pixel_area_m2 = _pixel_area_from_dataset(src)
+        except Exception:
+            pixel_area_m2 = 1.0
         height, width = src.height, src.width
         if progress:
             progress(0, 4, "Rasterizing segments")
@@ -510,6 +536,7 @@ def apply_model_with_pixel_sampling(
         sample_store: dict[int, np.ndarray] = {}
         sample_counts: dict[int, int] = defaultdict(int)
         total_seen: dict[int, int] = defaultdict(int)
+        pixel_counts: dict[int, int] = defaultdict(int)
         rng = np.random.default_rng(42)
 
         if progress:
@@ -538,6 +565,7 @@ def apply_model_with_pixel_sampling(
                 pix = data[:, mask_seg].reshape(data.shape[0], -1).T
                 if pix.size == 0:
                     continue
+                pixel_counts[int(seg_val)] += int(pix.shape[0])
                 store = sample_store.get(int(seg_val))
                 if store is None:
                     store = np.zeros((cap, bands), dtype=np.float32)
@@ -552,6 +580,14 @@ def apply_model_with_pixel_sampling(
                         j = rng.integers(0, ts)
                         if j < cap:
                             store[j] = row
+
+        if pixel_counts:
+            gdf["pixel_count"] = [
+                int(pixel_counts.get(int(seg_id), 0)) if pd.notna(seg_id) else 0
+                for seg_id in gdf["seg_id"]
+            ]
+        else:
+            gdf["pixel_count"] = 0
 
         sample_pixels: List[np.ndarray] = []
         sample_seg_ids: List[np.ndarray] = []
@@ -593,11 +629,24 @@ def apply_model_with_pixel_sampling(
                 gdf.at[row_idx, "majority"] = str(maj)
 
     bio_key = (biomass_model or "madagascar").strip().lower()
-    raw_area = gdf["plot_area"].astype(float) if "plot_area" in gdf.columns else None
-    area_m2 = _area_m2_from_values(gdf, raw_area)
-    area_cm2 = np.maximum(area_m2, 0.0) * 10000.0
-    gdf["plot_area_cm2"] = area_cm2
-    gdf["biomass_g"] = _biomass_from_area_cm2(area_cm2, bio_key)
+    gdf = _merge_segments_by_majority(gdf, cls_to_field)
+    try:
+        counts = gdf["pixel_count"].astype(float)
+    except Exception:
+        counts = np.zeros(len(gdf), dtype=np.float64)
+    counts = np.maximum(counts, 0.0)
+    try:
+        pixel_area_scale = float(pixel_area_m2)
+    except Exception:
+        pixel_area_scale = 1.0
+    if pixel_area_scale <= 0:
+        pixel_area_scale = 1.0
+    gdf["plot_area_m2"] = counts * pixel_area_scale
+    pixel_area_cm2 = pixel_area_scale * 10000.0
+    gdf["plot_area_cm2"] = counts * pixel_area_cm2
+    biomass_per_pixel = float(np.asarray(_biomass_from_area_cm2(pixel_area_cm2, bio_key)).item())
+    gdf["biomass_g"] = counts * biomass_per_pixel
+    gdf["biomass_t"] = gdf["biomass_g"] / 1_000_000.0
 
     base_out = Path(output_root)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -608,10 +657,15 @@ def apply_model_with_pixel_sampling(
         keep_cols.append("seg_id")
     if "plot_id" in gdf.columns:
         keep_cols.append("plot_id")
-    if "plot_area" in gdf.columns:
-        keep_cols.append("plot_area")
-    keep_cols.append("plot_area_cm2")
-    keep_cols.append("biomass_g")
+    if "plot_area_m2" in gdf.columns:
+        keep_cols.append("plot_area_m2")
+    if "plot_area_cm2" in gdf.columns:
+        keep_cols.append("plot_area_cm2")
+    keep_cols.append("pixel_count")
+    if "biomass_g" in gdf.columns:
+        keep_cols.append("biomass_g")
+    if "biomass_t" in gdf.columns:
+        keep_cols.append("biomass_t")
     keep_cols.extend([c for c in cls_to_field.values()])
     keep_cols.append("majority")
     keep_cols = [c for c in keep_cols if c in gdf.columns]
