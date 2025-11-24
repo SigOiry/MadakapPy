@@ -20,6 +20,9 @@ class Session:
     seg_minsize: int = 5
     seg_otb_bin: Optional[str] = None
     biomass_model: str = "madagascar"
+    biomass_formula: Optional[str] = None
+    growth_rate_pct: float = 5.8
+    growth_rate_sd: float = 0.7
 
 
 def save_session(session: Session, location: Path | None = None) -> Path:
@@ -47,4 +50,7 @@ def load_session(location: Path | None = None) -> Optional[Session]:
         seg_minsize=int(data.get("seg_minsize", 5)),
         seg_otb_bin=data.get("seg_otb_bin"),
         biomass_model=(data.get("biomass_model") or "madagascar"),
+        biomass_formula=data.get("biomass_formula"),
+        growth_rate_pct=float(data.get("growth_rate_pct", 5.8)),
+        growth_rate_sd=float(data.get("growth_rate_sd", 0.7)),
     )

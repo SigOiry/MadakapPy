@@ -738,12 +738,18 @@ def run_flet_app() -> None:
                         ((record.get("settings") or {}).get("classification") or {}).get("biomass_model")
                         or "madagascar"
                     )
+                    bf = ((record.get("settings") or {}).get("classification") or {}).get("biomass_formula")
+                    gr = float(((record.get("settings") or {}).get("classification") or {}).get("growth_rate_pct", 5.8))
+                    gr_sd = float(((record.get("settings") or {}).get("classification") or {}).get("growth_rate_sd", 0.7))
                     new_preview = build_classification_map(
                         shp,
                         raster,
                         mode="stats" if mode_val == "stats" else "rf",
                         aoi_path=record.get("aoi_path"),
                         biomass_model=bm,
+                        biomass_formula=bf,
+                        growth_rate_pct=gr,
+                        growth_rate_sd=gr_sd,
                     )
                 except Exception as exc:  # noqa: BLE001
                     page.pubsub.send_all({"kind": "result", "text": f"Failed to rebuild preview: {exc}"})
@@ -786,11 +792,26 @@ def run_flet_app() -> None:
                 "spatialr": _field_int(spatialr, 5),
                 "minsize": _field_int(minsize, 5),
             }
+            bio_mode = (biomass_mode.value or "preset")
+            bio_formula_val = (biomass_formula.value or "").strip()
+            bio_model_val = (biomass_model.value or "madagascar")
+            try:
+                growth_rate_val = float(growth_rate.value or "5.8")
+            except Exception:
+                growth_rate_val = 5.8
+            try:
+                growth_sd_val = float(growth_sd.value or "0.7")
+            except Exception:
+                growth_sd_val = 0.7
             clf_vals = {
                 "mode": (classifier_mode.value or "rf"),
                 "model_path": _clean(model_path),
                 "max_pixels_per_polygon": _field_int(max_pixels_per_polygon, 200),
-                "biomass_model": (biomass_model.value or "madagascar"),
+                "biomass_mode": bio_mode,
+                "biomass_model": "custom" if bio_mode == "custom" else bio_model_val,
+                "biomass_formula": bio_formula_val if bio_mode == "custom" else None,
+                "growth_rate_pct": growth_rate_val,
+                "growth_rate_sd": growth_sd_val,
             }
             train_vals = {
                 "training_image": _clean(train_image),
@@ -963,6 +984,11 @@ def run_flet_app() -> None:
                 step_text.value = "Custom AOI shapefile not found"; page.update(); return
             if custom_path and not custom_path.lower().endswith(".shp"):
                 step_text.value = "Custom AOI must be a .shp file"; page.update(); return
+            bio_mode_val = (biomass_mode.value or "preset")
+            if bio_mode_val == "custom" and not (biomass_formula.value or "").strip():
+                step_text.value = "Enter biomass (g) = f(x) with x as plot area (cm^2)"
+                page.update()
+                return
             settings_snapshot = collect_run_settings()
             def worker():
                 try:
@@ -1029,6 +1055,9 @@ def run_flet_app() -> None:
                     bio_model = (
                         (settings_snapshot.get("classification") or {}).get("biomass_model") or "madagascar"
                     )
+                    bio_formula = (settings_snapshot.get("classification") or {}).get("biomass_formula")
+                    growth_rate_val = float((settings_snapshot.get("classification") or {}).get("growth_rate_pct", 5.8))
+                    growth_sd_val = float((settings_snapshot.get("classification") or {}).get("growth_rate_sd", 0.7))
                     mode_local = mode_sel
                     # Preselection first
                     custom_path_local = custom_path
@@ -1209,6 +1238,9 @@ def run_flet_app() -> None:
                                 generate_preview=True,
                                 aoi_path=aoi_final,
                                 biomass_model=bio_model,
+                                biomass_formula=bio_formula,
+                                growth_rate_pct=growth_rate_val,
+                                growth_rate_sd=growth_sd_val,
                             )
                             summary_text = f"Workflow complete. Classification saved to:\n{cls_res.output_path}"
                             result_output_path = str(cls_res.output_path)
@@ -1220,6 +1252,9 @@ def run_flet_app() -> None:
                                 str(combined_path),
                                 output_dir.value.strip(),
                                 biomass_model=bio_model,
+                                biomass_formula=bio_formula,
+                                growth_rate_pct=growth_rate_val,
+                                growth_rate_sd=growth_sd_val,
                                 progress=lambda d, t, n: page.pubsub.send_all(
                                     {
                                         "kind": "progress",
@@ -1242,6 +1277,9 @@ def run_flet_app() -> None:
                                     mode="stats",
                                     aoi_path=aoi_final,
                                     biomass_model=bio_model,
+                                    biomass_formula=bio_formula,
+                                    growth_rate_pct=growth_rate_val,
+                                    growth_rate_sd=growth_sd_val,
                                 )
                             except Exception:
                                 preview_path = None
@@ -1372,13 +1410,53 @@ def run_flet_app() -> None:
         )
         model_hint = ft.Text("", size=12, color=pal["muted"])
         max_pixels_per_polygon = ft.TextField(value="200", width=120, hint_text="Pixels/polygon", text_align=ft.TextAlign.RIGHT)
+        biomass_mode = ft.RadioGroup(
+            value="preset",
+            content=ft.Row(
+                [
+                    ft.Radio(value="preset", label="Preset model"),
+                    ft.Radio(value="custom", label="Custom equation"),
+                ],
+                wrap=True,
+            ),
+        )
         biomass_model = ft.Dropdown(
             value="madagascar",
             options=[
-                ft.dropdown.Option(key="madagascar", text="Madagascar (linear forced to 0)"),
-                ft.dropdown.Option(key="indonesia", text="Indonesia (Nurdin et al. 2023)"),
+                ft.dropdown.Option(key="madagascar", text="Madagascar (default curve)"),
+                # ft.dropdown.Option(key="indonesia", text="Indonesia (Nurdin et al. 2023)"),
             ],
             width=220,
+        )
+        biomass_formula = ft.TextField(
+            value="",
+            width=260,
+            hint_text="Example: 0.8 * x ** 1.25",
+        )
+        biomass_hint = ft.Text("Use x for the plot area in square centimeters.", size=12, color=pal["muted"])
+        def sync_biomass_mode(_=None) -> None:
+            is_custom = (biomass_mode.value or "preset") == "custom"
+            biomass_model.disabled = is_custom
+            biomass_formula.disabled = not is_custom
+            if is_custom:
+                biomass_model.value = "custom"
+            _safe_update(biomass_model)
+            _safe_update(biomass_formula)
+
+        biomass_mode.on_change = sync_biomass_mode
+        growth_rate = ft.TextField(
+            value="5.8",
+            width=120,
+            suffix_text="%/day",
+            text_align=ft.TextAlign.RIGHT,
+            tooltip="Daily growth rate applied to biomass to project the next 7 days.",
+        )
+        growth_sd = ft.TextField(
+            value="0.7",
+            width=120,
+            suffix_text="%/day",
+            text_align=ft.TextAlign.RIGHT,
+            tooltip="Standard deviation for growth rate (informational).",
         )
         train_polys = ft.TextField(value="", expand=True, hint_text="Training polygons (.shp/.gpkg/.geojson)")
         class_column = ft.Dropdown(options=[], expand=True)
@@ -1502,15 +1580,50 @@ def run_flet_app() -> None:
                 icon=ft.icons.SPEED,
                 tip="Number of pixels sampled in each polygon when applying the model.",
             ),
-            labeled_row(
-                "Biomass model",
-                biomass_model,
-                icon=ft.icons.BIOTECH,
-                tip="Choose the biomass estimation curve used in outputs and previews.",
-            ),
             train_tab_btn,
             subtitle="Choose between a trained Random Forest and the simple statistics classifier.",
             bgcolor="#FFF4EA",
+        )
+        bio_section = section(
+            "Biomass Estimation",
+            labeled_row(
+                "Mode",
+                biomass_mode,
+                icon=ft.icons.SCIENCE,
+                tip="Switch between presets and your own biomass equation.",
+            ),
+            labeled_row(
+                "Preset model",
+                biomass_model,
+                icon=ft.icons.BIOTECH,
+                tip="Built-in biomass-area relationships.",
+            ),
+            labeled_row(
+                "Biomass (g) =",
+                biomass_formula,
+                icon=ft.icons.FORMAT_COLOR_TEXT,
+                tip="Enter biomass (g) = f(x) with x as plot area (cm^2).",
+            ),
+            ft.Row(
+                [
+                    labeled_row(
+                        "Growth rate",
+                        growth_rate,
+                        icon=ft.icons.TRENDING_UP,
+                        tip="Daily growth rate (%) used to project biomass for the next 7 days.",
+                    ),
+                    labeled_row(
+                        "Std. dev.",
+                        growth_sd,
+                        icon=ft.icons.SHOW_CHART,
+                        tip="Standard deviation for the growth rate (stored for reference).",
+                    ),
+                ],
+                wrap=True,
+            ),
+            ft.Container(biomass_hint, padding=ft.padding.only(left=12)),
+            subtitle="Choose \"Custom equation\" and use x for plot area (cm^2).",
+            bgcolor="#EEF4ED",
         )
         def on_train_model(_):
             switch_to_training_tab()
@@ -1661,23 +1774,32 @@ def run_flet_app() -> None:
 
         # Two-column responsive layout: each section ~half width
         left_col = ft.Column([left, pre], expand=1, spacing=12)
-        right_col = ft.Column([seg, clf], expand=1, spacing=12)
+        right_col = ft.Column([seg, clf, bio_section], expand=1, spacing=12)
 
-        workflow_body = ft.Column(
+        main_row = ft.Row(
+            [left_col, right_col],
+            expand=True,
+            spacing=12,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
+        action_row = ft.Row(
             [
-                ft.Row([left_col, right_col], expand=True, spacing=12),
-                ft.Row(
-                    [
-                        ft.Container(expand=True),
-                        pre_btn,
-                        run_btn,
-                    ],
-                    alignment=ft.MainAxisAlignment.END,
-                    spacing=12,
-                ),
+                ft.Container(expand=True),
+                pre_btn,
+                run_btn,
+            ],
+            alignment=ft.MainAxisAlignment.END,
+            spacing=12,
+        )
+        workflow_body = ft.ListView(
+            controls=[
+                ft.Container(content=main_row, expand=True),
+                ft.Container(content=action_row, expand=True),
             ],
             expand=True,
             spacing=12,
+            auto_scroll=False,
+            padding=0,
         )
 
         training_body = ft.Column(
@@ -1781,6 +1903,7 @@ def run_flet_app() -> None:
             )
         )
 
+        sync_biomass_mode()
         sync_classifier_mode()
         refresh_model_list()
         refresh_history_panel()

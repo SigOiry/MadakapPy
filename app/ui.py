@@ -62,6 +62,10 @@ class ImageSelectorApp(ttk.Frame):
         self.var_model_path = tk.StringVar()
         self.var_classifier_mode = tk.StringVar(value="rf")
         self.var_biomass_model = tk.StringVar(value="madagascar")
+        self.var_biomass_mode = tk.StringVar(value="preset")
+        self.var_biomass_formula = tk.StringVar()
+        self.var_growth_rate = tk.DoubleVar(value=5.8)
+        self.var_growth_sd = tk.DoubleVar(value=0.7)
         self.var_train_raster = tk.StringVar(value=self.var_in_raster.get())
         self.var_train_path = tk.StringVar()
         self.var_class_col = tk.StringVar()
@@ -291,9 +295,28 @@ class ImageSelectorApp(ttk.Frame):
         self.max_pixels_entry = ttk.Entry(applyf, textvariable=self.var_max_pixels_per_polygon, width=12)
         self.max_pixels_entry.grid(row=0, column=1, sticky="w", padx=6, pady=4)
         self._rf_controls.append(self.max_pixels_entry)
-        ttk.Label(applyf, text="Biomass model").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        # Apply happens as part of full workflow
+
+        biof = ttk.LabelFrame(right, text="Biomass estimation", style="SectionAlt.TLabelframe")
+        biof.grid(row=3, column=0, sticky="we", pady=(8, 0))
+        biof.columnconfigure(1, weight=1)
+        ttk.Radiobutton(
+            biof,
+            text="Preset model",
+            value="preset",
+            variable=self.var_biomass_mode,
+            command=self._update_biomass_mode_state,
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Radiobutton(
+            biof,
+            text="Custom equation",
+            value="custom",
+            variable=self.var_biomass_mode,
+            command=self._update_biomass_mode_state,
+        ).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(biof, text="Preset model").grid(row=1, column=0, sticky="w", padx=6, pady=4)
         self.cmb_biomass_model = ttk.Combobox(
-            applyf,
+            biof,
             values=("madagascar", "indonesia"),
             textvariable=self.var_biomass_model,
             state="readonly",
@@ -301,7 +324,17 @@ class ImageSelectorApp(ttk.Frame):
         )
         self.cmb_biomass_model.grid(row=1, column=1, sticky="w", padx=6, pady=4)
         self.cmb_biomass_model.current(0)
-        # Apply happens as part of full workflow
+        self.var_biomass_mode.trace_add("write", lambda *_: self._update_biomass_mode_state())
+        ttk.Label(biof, text="biomass (g) =").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        self.txt_biomass_formula = ttk.Entry(biof, textvariable=self.var_biomass_formula)
+        self.txt_biomass_formula.grid(row=2, column=1, sticky="we", padx=6, pady=4)
+        ttk.Label(biof, text="Use x for the plot area in cm^2", foreground="#666").grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6)
+        )
+        ttk.Label(biof, text="Growth rate (%/day)").grid(row=4, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(biof, textvariable=self.var_growth_rate, width=12).grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(biof, text="Std. dev. (%/day)").grid(row=5, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(biof, textvariable=self.var_growth_sd, width=12).grid(row=5, column=1, sticky="w", padx=6, pady=4)
 
         # Footer / status
         footer = ttk.Frame(workflow_tab, padding=(0, 8, 0, 0), style="Footer.TFrame")
@@ -361,6 +394,7 @@ class ImageSelectorApp(ttk.Frame):
 
         self._update_custom_aoi_state()
         self._update_classifier_mode_state()
+        self._update_biomass_mode_state()
 
         # Shortcuts
         try:
@@ -384,6 +418,7 @@ class ImageSelectorApp(ttk.Frame):
         if state == "normal":
             self._update_custom_aoi_state()
             self._update_classifier_mode_state()
+            self._update_biomass_mode_state()
 
     def _update_custom_aoi_state(self, *_):
         if self._controls_state != "normal":
@@ -418,6 +453,20 @@ class ImageSelectorApp(ttk.Frame):
             hint = "Random Forest controls disabled while using the statistics-based classifier."
         if hasattr(self, "model_hint_label"):
             self.model_hint_label.configure(text=hint)
+
+    def _update_biomass_mode_state(self, *_):
+        if self._controls_state != "normal":
+            return
+        mode = (self.var_biomass_mode.get() or "preset").lower()
+        is_custom = mode == "custom"
+        try:
+            self.cmb_biomass_model.configure(state="disabled" if is_custom else "readonly")
+        except Exception:
+            pass
+        try:
+            self.txt_biomass_formula.configure(state="normal" if is_custom else "disabled")
+        except Exception:
+            pass
 
     def _update_progress(self, done: int, total: int, start_time: float, note: str = "") -> None:
         self.progress.configure(maximum=max(1, total), value=done)
@@ -522,6 +571,14 @@ class ImageSelectorApp(ttk.Frame):
             return
         classifier_mode = (self.var_classifier_mode.get() or "rf").lower()
         initial_model_path = (self.var_model_path.get() or "").strip()
+        bio_mode = (self.var_biomass_mode.get() or "preset").lower()
+        bio_model = (self.var_biomass_model.get() or "madagascar").strip().lower()
+        bio_formula = (self.var_biomass_formula.get() or "").strip()
+        if bio_mode == "custom" and not bio_formula:
+            self._toast("Enter biomass (g) = f(x) using x for the plot area (cm^2)", kind="error")
+            return
+        growth_rate = float(self.var_growth_rate.get() or 5.8)
+        growth_sd = float(self.var_growth_sd.get() or 0.7)
 
         session = Session(
             images=self.images,
@@ -531,7 +588,10 @@ class ImageSelectorApp(ttk.Frame):
             seg_spatialr=int(self.var_spatialr.get()),
             seg_minsize=int(self.var_minsize.get()),
             seg_otb_bin=self.var_otb_bin.get() or None,
-            biomass_model=(self.var_biomass_model.get() or "madagascar").strip().lower(),
+            biomass_model=("custom" if bio_mode == "custom" else bio_model),
+            biomass_formula=(bio_formula if bio_mode == "custom" else None),
+            growth_rate_pct=growth_rate,
+            growth_rate_sd=growth_sd,
         )
         save_session(session, Path(self.output_dir))
 
@@ -688,6 +748,9 @@ class ImageSelectorApp(ttk.Frame):
                         generate_preview=True,
                         aoi_path=self._last_aoi_path,
                         biomass_model=session.biomass_model,
+                        biomass_formula=session.biomass_formula,
+                        growth_rate_pct=session.growth_rate_pct,
+                        growth_rate_sd=session.growth_rate_sd,
                     )
                     if apply_res.preview_map:
                         self.after(0, lambda p=apply_res.preview_map: self._display_classification_preview(p))
@@ -700,6 +763,9 @@ class ImageSelectorApp(ttk.Frame):
                         self._last_seg_path,
                         session.output_dir,
                         biomass_model=session.biomass_model,
+                        biomass_formula=session.biomass_formula,
+                        growth_rate_pct=session.growth_rate_pct,
+                        growth_rate_sd=session.growth_rate_sd,
                         progress=make_cb("Statistics"),
                     )
                     summary = f"Statistics classifier: {stats_res.selected_count} polygons selected by spectral rules."
@@ -708,10 +774,13 @@ class ImageSelectorApp(ttk.Frame):
                         preview_path = build_classification_map(
                             stats_res.output_path,
                             session.seg_in_raster,
-                            mode="stats",
-                            aoi_path=self._last_aoi_path,
-                            biomass_model=session.biomass_model,
-                        )
+                        mode="stats",
+                        aoi_path=self._last_aoi_path,
+                        biomass_model=session.biomass_model,
+                        biomass_formula=session.biomass_formula,
+                        growth_rate_pct=session.growth_rate_pct,
+                        growth_rate_sd=session.growth_rate_sd,
+                    )
                     except Exception:
                         preview_path = None
                     if preview_path:
@@ -1080,7 +1149,13 @@ class ImageSelectorApp(ttk.Frame):
             messagebox.showwarning("No segments", "Run segmentation first")
             return
         out_root = self.output_dir or self.out_entry.get()
-        self._set_status("Classifying segments…")
+        bio_mode = (self.var_biomass_mode.get() or "preset").lower()
+        bio_model = (self.var_biomass_model.get() or "madagascar").strip().lower()
+        bio_formula = (self.var_biomass_formula.get() or "").strip()
+        if bio_mode == "custom" and not bio_formula:
+            messagebox.showwarning("Missing biomass equation", "Enter biomass (g) = f(x) using x as plot area (cm^2).")
+            return
+        self._set_status("Classifying segments.")
 
         def cb(done: int, total: int, note: str = ""):
             start = getattr(self, "_apply_start", None)
@@ -1105,7 +1180,10 @@ class ImageSelectorApp(ttk.Frame):
                     progress=cb,
                     generate_preview=True,
                     aoi_path=self._last_aoi_path,
-                    biomass_model=(self.var_biomass_model.get() or "madagascar").strip().lower(),
+                    biomass_model=("custom" if bio_mode == "custom" else bio_model),
+                    biomass_formula=(bio_formula if bio_mode == "custom" else None),
+                    growth_rate_pct=growth_rate,
+                    growth_rate_sd=growth_sd,
                 )
                 def ok():
                     self._set_status("Classification complete")

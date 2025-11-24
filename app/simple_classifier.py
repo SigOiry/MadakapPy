@@ -11,6 +11,10 @@ import numpy as np
 import rasterio
 from rasterio.mask import mask as rio_mask
 from shapely.geometry import mapping
+try:
+    from .biomass import biomass_from_area_cm2
+except Exception:  # noqa: BLE001
+    from biomass import biomass_from_area_cm2  # type: ignore
 
 
 Progress = Callable[[int, int, str], None]
@@ -52,14 +56,26 @@ def _band_stats(
     return means, stds
 
 
-def _biomass_from_area_cm2(area_cm2: np.ndarray | float, model: str) -> np.ndarray:
-    arr = np.asarray(area_cm2, dtype=np.float64)
-    arr = np.maximum(arr, 0.0)
-    model_key = (model or "madagascar").strip().lower()
-    if model_key == "indonesia":
-        with np.errstate(invalid="ignore"):
-            return 0.014 * np.power(arr, 1.65)
-    return (-0.0022 * arr * arr) + (2.3389 * arr) + 29.771
+def _pixel_area_from_dataset(src: rasterio.io.DatasetReader) -> float:
+    """Return pixel area in square meters."""
+    try:
+        res_x, res_y = src.res
+        val = abs(float(res_x) * float(res_y))
+        if val > 0:
+            return val
+    except Exception:
+        pass
+    try:
+        transform = getattr(src, "transform", None)
+        if transform is not None:
+            res_x = abs(float(getattr(transform, "a", 0.0)))
+            res_y = abs(float(getattr(transform, "e", 0.0)))
+            val = res_x * res_y
+            if val > 0:
+                return val
+    except Exception:
+        pass
+    return 1.0
 
 
 def classify_dark_linear_polygons(
@@ -67,6 +83,9 @@ def classify_dark_linear_polygons(
     segments_path: str | Path,
     output_root: str | Path,
     biomass_model: str = "madagascar",
+    biomass_formula: str | None = None,
+    growth_rate_pct: float = 5.8,
+    growth_rate_sd: float = 0.7,
     progress: Optional[Progress] = None,
 ) -> SimpleClassifyResult:
     """
@@ -86,8 +105,14 @@ def classify_dark_linear_polygons(
         raise RuntimeError("No segments available for classification.")
 
     with rasterio.open(raster_path) as src:
+        if getattr(getattr(src, "crs", None), "is_projected", False) is False:
+            raise RuntimeError("Input raster must be in a projected CRS (e.g., UTM) so pixel size is in meters.")
         if seg_crs and src.crs and str(seg_crs) != str(src.crs):
             gdf = gdf.to_crs(src.crs)
+        pixel_area_m2 = _pixel_area_from_dataset(src)
+        if pixel_area_m2 <= 0:
+            pixel_area_m2 = 1.0
+        pixel_area_cm2 = pixel_area_m2 * 10000.0
 
         band_means = np.full((total, 3), np.nan, dtype=np.float32)
         band_stds = np.full((total, 3), np.nan, dtype=np.float32)
@@ -222,9 +247,22 @@ def classify_dark_linear_polygons(
     gdf["cluster_id"] = np.where(selected, 1, 0)
     gdf["selected"] = selected
 
-    area_cm2 = np.asarray(gdf.geometry.area, dtype=np.float64) * 10000.0
-    gdf["plot_area_cm2"] = area_cm2
-    gdf["biomass_g"] = _biomass_from_area_cm2(area_cm2, biomass_model)
+    area_m2 = np.asarray(gdf.geometry.area, dtype=np.float64)
+    area_m2 = np.maximum(area_m2, 0.0)
+    biomass_per_pixel = float(np.asarray(biomass_from_area_cm2(pixel_area_cm2, biomass_model, biomass_formula)).item())
+    pix_counts = np.where(pixel_area_m2 > 0, area_m2 / pixel_area_m2, 0.0)
+    gdf["area_m2"] = area_m2
+    gdf["area_cm2"] = area_m2 * 10000.0
+    gdf["pix_count"] = pix_counts
+    gdf["biomass_g"] = pix_counts * biomass_per_pixel
+    try:
+        rate = float(growth_rate_pct) / 100.0
+    except Exception:
+        rate = 0.0
+    rate = max(rate, 0.0)
+    growth_factor = 1.0 + rate
+    for day in range(1, 8):
+        gdf[f"b_day{day}"] = gdf["biomass_g"] * (growth_factor ** day)
 
     if seg_crs:
         gdf = gdf.to_crs(seg_crs)

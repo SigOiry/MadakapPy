@@ -16,6 +16,10 @@ import rasterio
 from rasterio import features as rio_features
 from rasterio.mask import mask as rio_mask
 from shapely.geometry import mapping
+try:
+    from .biomass import biomass_from_area_cm2
+except Exception:  # noqa: BLE001
+    from biomass import biomass_from_area_cm2  # type: ignore
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV, cross_val_predict
@@ -57,16 +61,6 @@ def _model_dir(base_out: Path) -> Path:
     if base_out.name.lower() == "output":
         return base_out.parent / "Model"
     return base_out / "Model"
-
-
-def _biomass_from_area_cm2(area_cm2: np.ndarray | float, model: str) -> np.ndarray:
-    arr = np.asarray(area_cm2, dtype=np.float64)
-    arr = np.maximum(arr, 0.0)
-    model_key = (model or "madagascar").strip().lower()
-    if model_key == "indonesia":
-        with np.errstate(invalid="ignore"):
-            return 0.014 * np.power(arr, 1.65)
-    return (0.5621 * arr)
 
 def _merge_segments_by_majority(gdf: gpd.GeoDataFrame, cls_to_field: dict[str, str]) -> gpd.GeoDataFrame:
     if "majority" not in gdf.columns:
@@ -471,6 +465,9 @@ def apply_model_with_pixel_sampling(
     generate_preview: bool = False,
     aoi_path: str | os.PathLike | None = None,
     biomass_model: str = "madagascar",
+    biomass_formula: str | None = None,
+    growth_rate_pct: float = 5.8,
+    growth_rate_sd: float = 0.7,
 ) -> ApplyResult:
     payload = joblib.load(model_path)
     rf: RandomForestClassifier = payload["model"]
@@ -503,7 +500,9 @@ def apply_model_with_pixel_sampling(
     start = time.time()
     pixel_area_m2 = 1.0
     with rasterio.open(raster_path) as src:
-        # Reproject segments to raster CRS if needed
+        if getattr(getattr(src, "crs", None), "is_projected", False) is False:
+            raise RuntimeError("Input raster must be in a projected CRS (e.g., UTM) so pixel size is in meters.")
+        # Reproject segments to raster CRS if needed (prefer projected CRS, ideally UTM)
         try:
             if hasattr(gdf, "crs") and gdf.crs and src.crs and str(gdf.crs) != str(src.crs):
                 gdf = gdf.to_crs(src.crs)
@@ -644,9 +643,19 @@ def apply_model_with_pixel_sampling(
     gdf["plot_area_m2"] = counts * pixel_area_scale
     pixel_area_cm2 = pixel_area_scale * 10000.0
     gdf["plot_area_cm2"] = counts * pixel_area_cm2
-    biomass_per_pixel = float(np.asarray(_biomass_from_area_cm2(pixel_area_cm2, bio_key)).item())
-    gdf["biomass_g"] = counts * biomass_per_pixel
+    try:
+        gdf["biomass_g"] = biomass_from_area_cm2(gdf["plot_area_cm2"].to_numpy(), bio_key, biomass_formula)
+    except Exception:
+        gdf["biomass_g"] = biomass_from_area_cm2(gdf["plot_area_cm2"], bio_key, biomass_formula)
     gdf["biomass_t"] = gdf["biomass_g"] / 1_000_000.0
+    try:
+        rate = float(growth_rate_pct) / 100.0
+    except Exception:
+        rate = 0.0
+    rate = max(rate, 0.0)
+    growth_factor = 1.0 + rate
+    for day in range(1, 8):
+        gdf[f"b_day{day}"] = gdf["biomass_g"] * (growth_factor ** day)
 
     base_out = Path(output_root)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -657,11 +666,21 @@ def apply_model_with_pixel_sampling(
         keep_cols.append("seg_id")
     if "plot_id" in gdf.columns:
         keep_cols.append("plot_id")
-    if "plot_area_m2" in gdf.columns:
-        keep_cols.append("plot_area_m2")
-    if "plot_area_cm2" in gdf.columns:
-        keep_cols.append("plot_area_cm2")
-    keep_cols.append("pixel_count")
+    rename_map = {
+        "plot_area_m2": "area_m2",
+        "plot_area_cm2": "area_cm2",
+        "pixel_count": "pix_count",
+    }
+    gdf = gdf.rename(columns={k: v for k, v in rename_map.items() if k in gdf.columns})
+    if "area_m2" in gdf.columns:
+        keep_cols.append("area_m2")
+    if "area_cm2" in gdf.columns:
+        keep_cols.append("area_cm2")
+    keep_cols.append("pix_count")
+    for day in range(1, 8):
+        fld = f"b_day{day}"
+        if fld in gdf.columns:
+            keep_cols.append(fld)
     if "biomass_g" in gdf.columns:
         keep_cols.append("biomass_g")
     if "biomass_t" in gdf.columns:
@@ -682,6 +701,9 @@ def apply_model_with_pixel_sampling(
                 mode="rf",
                 aoi_path=aoi_path,
                 biomass_model=bio_key,
+                biomass_formula=biomass_formula,
+                growth_rate_pct=growth_rate_pct,
+                growth_rate_sd=growth_rate_sd,
             )
         except Exception:
             preview_path = None

@@ -11,6 +11,10 @@ import numpy as np
 import rasterio
 from rasterio.warp import transform_bounds
 from shapely.geometry import mapping
+try:
+    from .biomass import biomass_from_area_m2
+except Exception:  # noqa: BLE001
+    from biomass import biomass_from_area_m2  # type: ignore
 
 
 def _load_raster_overlay(raster_path: Path) -> tuple[str, str]:
@@ -162,13 +166,9 @@ def _class_column(gdf: gpd.GeoDataFrame) -> str | None:
     return None
 
 
-def _biomass_from_area(area_m2: float, model: str = "madagascar") -> float:
+def _biomass_from_area(area_m2: float, model: str = "madagascar", biomass_formula: str | None = None) -> float:
     area_m2 = max(0.0, float(area_m2))
-    area_cm2 = area_m2 * 10000.0
-    key = (model or "madagascar").strip().lower()
-    if key == "indonesia":
-        return 0.014 * (area_cm2 ** 1.65)
-    return (-0.0022 * area_cm2 * area_cm2) + (2.3389 * area_cm2) + 29.771
+    return float(np.asarray(biomass_from_area_m2(area_m2, model=model, custom_formula=biomass_formula)).item())
 
 
 def _build_features(
@@ -176,6 +176,7 @@ def _build_features(
     areas_m2: Iterable[float],
     mode: str,
     biomass_model: str,
+    biomass_formula: str | None,
 ) -> tuple[list[dict], dict[str, str]]:
     features: list[dict] = []
     palette = [
@@ -207,7 +208,7 @@ def _build_features(
         if biomass_val is not None and np.isfinite(biomass_val):
             biomass_clean = float(biomass_val)
         else:
-            biomass_clean = _biomass_from_area(area_clean, biomass_model)
+            biomass_clean = _biomass_from_area(area_clean, biomass_model, biomass_formula)
         props = {
             "plot_id": str(pid),
             "score": float(np.clip(score if np.isfinite(score) else 0.0, 0.0, 1.0)),
@@ -239,6 +240,9 @@ def build_classification_map(
     mode: str = "stats",
     aoi_path: str | Path | None = None,
     biomass_model: str = "madagascar",
+    biomass_formula: str | None = None,
+    growth_rate_pct: float = 5.8,
+    growth_rate_sd: float = 0.7,
 ) -> Path:
     shp_path = Path(shp_path)
     raster_path = Path(raster_path)
@@ -290,7 +294,7 @@ def build_classification_map(
         areas_m2 = _areas_by_feature(gdf, aoi_gdf, raster_crs)
 
         bounds_json, b64_png = _load_raster_overlay(raster_path)
-        features, class_colors = _build_features(gdf, areas_m2, mode.lower(), biomass_model)
+        features, class_colors = _build_features(gdf, areas_m2, mode.lower(), biomass_model, biomass_formula)
 
         aoi_features: list[dict] = []
         if aoi_gdf is not None and not aoi_gdf.empty:
@@ -351,6 +355,33 @@ def build_classification_map(
     .controls select { width: 100%; padding: 4px; }
     .stat { font-size: 0.85rem; color: #444; margin-top: 6px; }
     .class-list label { font-weight: 400; }
+    .chart-panel {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      background: rgba(255,255,255,0.96);
+      border-radius: 10px;
+      padding: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.25);
+      font-family: "Segoe UI", sans-serif;
+      width: 560px;
+      z-index: 1100;
+      display: none;
+    }
+    .chart-panel header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .chart-panel h3 { margin: 0; font-size: 1rem; }
+    .chart-panel button {
+      border: none;
+      background: #eee;
+      padding: 4px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -362,7 +393,15 @@ def build_classification_map(
     __CLASS_CHECKBOXES__
     <div class="stat" id="countStat"></div>
   </div>
+  <div class="chart-panel" id="chartPanel">
+    <header>
+      <h3 id="chartTitle">Biomass projection</h3>
+      <button id="closeChart">Close</button>
+    </header>
+    <canvas id="bioChart" width="520" height="340"></canvas>
+  </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script>
     const imageBounds = __BOUNDS__;
     const imageData = "data:image/png;base64,__IMAGE__";
@@ -373,6 +412,14 @@ def build_classification_map(
     const scoreMax = __SCORE_MAX__;
     const brightMin = __BRIGHT_MIN__;
     const brightMax = __BRIGHT_MAX__;
+    const growthRatePct = __GROWTH_RATE__;
+    const growthRateSd = __GROWTH_SD__;
+    const chartPanel = document.getElementById("chartPanel");
+    const chartTitle = document.getElementById("chartTitle");
+    const closeChart = document.getElementById("closeChart");
+    const chartCanvas = document.getElementById("bioChart");
+    let chartInstance = null;
+    let currentChartPid = null;
 
     const map = L.map('map', { maxZoom: 22 });
     L.imageOverlay(imageData, imageBounds).addTo(map);
@@ -441,11 +488,39 @@ def build_classification_map(
         const pid = props.plot_id || "plot";
         const a = Number(props.area_m2 || 0);
         const bio = Number(props.biomass_g || 0);
-        if (!totals[pid]) totals[pid] = { area: 0, biomass: 0 };
+        if (!totals[pid]) totals[pid] = { area: 0, biomass: 0, biomass_sd: 0 };
         if (isFinite(a) && a > 0) totals[pid].area += a;
-        if (isFinite(bio) && bio > 0) totals[pid].biomass += bio;
+        if (isFinite(bio) && bio > 0) {
+          totals[pid].biomass += bio;
+          const sdField = Number(props.biomass_sd || 0);
+          if (isFinite(sdField) && sdField > 0) {
+            totals[pid].biomass_sd += sdField * sdField; // sum variances
+          }
+        }
+      });
+      Object.values(totals).forEach(t => {
+        t.biomass_sd = Math.sqrt(t.biomass_sd);
       });
       return totals;
+    }
+    function projectBiomass(baseGram, baseSd) {
+      const rate = Math.max(0, Number(growthRatePct) || 0) / 100.0;
+      const sdRate = Math.max(0, Number(growthRateSd) || 0) / 100.0;
+      const mean = [];
+      const sd = [];
+      const base = Math.max(0, Number(baseGram) || 0);
+      const baseSdVal = Math.max(0, Number(baseSd) || 0);
+      mean.push(base);
+      sd.push(baseSdVal > 0 ? baseSdVal : base * sdRate);
+      for (let day = 1; day <= 7; day++) {
+        const prevMean = mean[day - 1];
+        const prevSd = sd[day - 1];
+        const nextMean = prevMean * (1 + rate);
+        const nextSd = Math.sqrt(Math.pow(prevSd * (1 + rate), 2) + Math.pow(prevMean * sdRate, 2));
+        mean.push(nextMean);
+        sd.push(nextSd);
+      }
+      return { mean, sd };
     }
 
     let currentPlotStats = computeAggregates(features);
@@ -467,7 +542,7 @@ def build_classification_map(
     function renderSegments() {
       segmentLayer.clearLayers();
       if (!toggleSegments.checked) {
-        currentPlotStats = {};
+        currentPlotStats = computeAggregates(features);
         countStat.textContent = "Segments hidden";
         aoiLayer.bringToFront();
         return;
@@ -496,6 +571,7 @@ def build_classification_map(
         items = items.filter(f => allowed.has((f.properties && f.properties.rf_class) || "Unknown"));
       }
       currentPlotStats = computeAggregates(items);
+      refreshChartIfOpen();
       items.forEach(f => {
         const props = f.properties;
         L.geoJSON(f.geometry, {
@@ -527,17 +603,14 @@ def build_classification_map(
             fillOpacity: 0.0,
           }),
           onEachFeature: (_feature, lyr) => {
-            lyr.on("mouseover", () => {
-              const stats = currentPlotStats[pid] || { area: 0, biomass: 0 };
-              const tons = (stats.biomass || 0) / 1000.0;
-              const text = `Plot ${pid}: ${stats.area.toLocaleString(undefined, {maximumFractionDigits: 2})} m^2 | Biomass: ${tons.toLocaleString(undefined, {maximumFractionDigits: 2})} kg`;
-              lyr.bindTooltip(text, { sticky: true }).openTooltip();
+            lyr.on("click", () => {
+              showChartForPlot(pid);
             });
-            lyr.on("mouseout", () => lyr.closeTooltip());
           },
         }).addTo(aoiLayer);
       });
       aoiLayer.bringToFront();
+      refreshChartIfOpen();
     }
 
     toggleSegments.addEventListener("change", renderSegments);
@@ -546,6 +619,132 @@ def build_classification_map(
     if (scoreSlider) scoreSlider.addEventListener("input", () => { refreshLabels(); renderSegments(); });
     if (brightMinSlider) brightMinSlider.addEventListener("input", () => { refreshLabels(); renderSegments(); });
     if (brightMaxSlider) brightMaxSlider.addEventListener("input", () => { refreshLabels(); renderSegments(); });
+    closeChart.addEventListener("click", () => {
+      chartPanel.style.display = "none";
+    });
+
+    function ensureChart(data) {
+      const labels = Array.from({length: data.mean.length}, (_, idx) => `Day ${idx}`);
+      const targetLine = 2.5; // tons
+      const eps = 1e-6;
+      const meanTons = data.mean.map(v => Math.max(eps, v / 1_000_000.0));
+      const lower = [];
+      const upper = [];
+      data.sd.forEach((sdVal, i) => {
+        const baseTons = meanTons[i];
+        const rel = Math.max(0, sdVal / Math.max(eps, data.mean[i]));
+        const factor = rel * i; // cumulative: day index multiplies sd
+        lower.push(Math.max(eps, baseTons * (1 - factor)));
+        upper.push(Math.max(eps, baseTons * (1 + factor)));
+      });
+      if (chartInstance) {
+        chartInstance.data.labels = labels;
+        chartInstance.data.datasets[0].data = meanTons;
+        chartInstance.options.plugins.errorBars.lower = lower;
+        chartInstance.options.plugins.errorBars.upper = upper;
+        chartInstance.options.plugins.targetLine.y = Math.max(eps, targetLine);
+        const yMax = Math.max(...upper, targetLine);
+        chartInstance.options.scales.y.max = yMax * 1.05;
+        chartInstance.update();
+        return;
+      }
+      const errorBarPlugin = {
+        id: "errorBars",
+        lower,
+        upper,
+        afterDatasetsDraw(chart, args, opts) {
+          const {ctx, scales: {x, y}} = chart;
+          ctx.save();
+          ctx.strokeStyle = "#555";
+          ctx.lineWidth = 1.5;
+          meanTons.forEach((val, i) => {
+            const xPos = x.getPixelForValue(i);
+            const yVal = y.getPixelForValue(opts.upper?.[i] || val);
+            const yMin = y.getPixelForValue(opts.lower?.[i] || val);
+            ctx.beginPath();
+            ctx.moveTo(xPos, yVal);
+            ctx.lineTo(xPos, yMin);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(xPos - 6, yVal);
+            ctx.lineTo(xPos + 6, yVal);
+            ctx.moveTo(xPos - 6, yMin);
+            ctx.lineTo(xPos + 6, yMin);
+            ctx.stroke();
+          });
+          ctx.restore();
+        }
+      };
+      const targetLinePlugin = {
+        id: "targetLine",
+        y: targetLine,
+        afterDraw(chart, args, opts) {
+          const {ctx, chartArea: {left, right}, scales: {y}} = chart;
+          const yPos = y.getPixelForValue(opts.y);
+          ctx.save();
+          ctx.strokeStyle = "red";
+          ctx.setLineDash([6, 6]);
+          ctx.beginPath();
+          ctx.moveTo(left, yPos);
+          ctx.lineTo(right, yPos);
+          ctx.stroke();
+          ctx.restore();
+        }
+      };
+      chartInstance = new Chart(chartCanvas.getContext("2d"), {
+        type: "bar",
+        data: {
+          labels,
+          datasets: [
+            {
+              label: "Biomass (tons)",
+              data: meanTons,
+              backgroundColor: "#88c0d0",
+            },
+          ],
+        },
+        options: {
+          responsive: false,
+          scales: {
+            y: {
+              beginAtZero: true,
+              min: 0,
+              title: {display: true, text: "Biomass (tons)"},
+              max: Math.max(...upper, targetLine) * 1.05,
+            },
+          },
+          plugins: {
+            legend: {display: false},
+            errorBars: {lower, upper},
+            targetLine: {y: Math.max(eps, targetLine)},
+          },
+        },
+        plugins: [errorBarPlugin, targetLinePlugin],
+      });
+    }
+
+    function showChartForPlot(pid) {
+      const stats = currentPlotStats[pid];
+      if (!stats || !isFinite(stats.biomass) || stats.biomass <= 0) {
+        chartTitle.textContent = `Plot ${pid}: no biomass available`;
+        chartPanel.style.display = "block";
+        if (chartInstance) chartInstance.destroy();
+        chartInstance = null;
+        currentChartPid = pid;
+        return;
+      }
+      const proj = projectBiomass(stats.biomass, stats.biomass_sd);
+      chartTitle.textContent = `Plot ${pid}: biomass projection`;
+      ensureChart(proj);
+      chartPanel.style.display = "block";
+      currentChartPid = pid;
+    }
+
+    function refreshChartIfOpen() {
+      if (chartPanel.style.display === "block" && currentChartPid) {
+        showChartForPlot(currentChartPid);
+      }
+    }
 
     buildAoiLayer();
     renderSegments();
@@ -559,6 +758,8 @@ def build_classification_map(
             .replace("__FEATURES__", json.dumps(features))
             .replace("__Aoi__", json.dumps(aoi_features))
             .replace("__CLASS_COLORS__", json.dumps(class_colors))
+            .replace("__GROWTH_RATE__", f"{float(growth_rate_pct):.6f}")
+            .replace("__GROWTH_SD__", f"{float(growth_rate_sd):.6f}")
             .replace(
                 "__CLASS_CHECKBOXES__",
                 ("<div class='class-list'>" + rf_controls + "</div>") if show_class_controls else "",
