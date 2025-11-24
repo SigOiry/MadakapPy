@@ -15,7 +15,9 @@ import pandas as pd
 import rasterio
 from rasterio import features as rio_features
 from rasterio.mask import mask as rio_mask
-from shapely.geometry import mapping
+import rasterio.features
+from shapely.geometry import mapping, shape as shapely_shape
+import scipy.ndimage as ndimage
 try:
     from .biomass import biomass_from_area_cm2
 except Exception:  # noqa: BLE001
@@ -453,6 +455,235 @@ def _sanitize_field_name(name: str, used: set[str]) -> str:
         i += 1
     used.add(candidate)
     return candidate
+
+
+def apply_model_pixelwise(
+    raster_path: str | os.PathLike,
+    model_path: str | os.PathLike,
+    output_root: str | os.PathLike,
+    aoi_path: str | os.PathLike | None = None,
+    biomass_model: str = "madagascar",
+    biomass_formula: str | None = None,
+    growth_rate_pct: float = 5.8,
+    growth_rate_sd: float = 0.7,
+    progress: Optional[Progress] = None,
+    generate_preview: bool = True,
+) -> ApplyResult:
+    """
+    Pixel-based RF classification with vectorization.
+    - Predicts per-pixel classes and probabilities.
+    - Vectorizes connected components of the predicted class map.
+    - Aggregates mean class probabilities per polygon and computes biomass projections.
+    """
+    payload = joblib.load(model_path)
+    rf: RandomForestClassifier = payload["model"]
+    le: LabelEncoder = payload["label_encoder"]
+    bands: int = payload["bands"]
+
+    start = time.time()
+    raster_path = str(raster_path)
+    base_out = Path(output_root)
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    folder = base_out / "Output" / f"PixelRF/Run_{ts}" if base_out.name.lower() != "output" else base_out / f"PixelRF/Run_{ts}"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(raster_path) as src:
+        if getattr(getattr(src, "crs", None), "is_projected", False) is False:
+            raise RuntimeError("Input raster must be in a projected CRS (e.g., UTM) so pixel size is in meters.")
+
+        mask_shapes = None
+        if aoi_path and os.path.exists(aoi_path):
+            try:
+                aoi = gpd.read_file(aoi_path)
+                if len(aoi) > 0:
+                    mask_shapes = [mapping(geom) for geom in aoi.geometry if geom is not None and not geom.is_empty]
+            except Exception:
+                mask_shapes = None
+
+        if progress:
+            progress(0, 4, "Reading raster")
+        aoi_id_grid = None
+        if mask_shapes:
+            data, transform = rio_mask(src, mask_shapes, crop=True, filled=False)
+            try:
+                shapes_with_ids = []
+                for idx, shp in enumerate(mask_shapes, start=1):
+                    shapes_with_ids.append((shp, idx))
+                if shapes_with_ids:
+                    aoi_id_grid = rasterio.features.rasterize(
+                        shapes_with_ids,
+                        out_shape=(data.shape[1], data.shape[2]),
+                        transform=transform,
+                        fill=0,
+                        default_value=0,
+                        dtype="int32",
+                    )
+            except Exception:
+                aoi_id_grid = None
+        else:
+            data = src.read()
+            transform = src.transform
+
+        if data.shape[0] < bands:
+            raise RuntimeError(f"Raster has {data.shape[0]} band(s) but model expects {bands}.")
+
+        data = data.astype("float32")
+        if np.isfinite(data).any() and float(np.nanmax(data)) > 1.0:
+            data /= 65535.0
+        data = data[:bands]
+        height, width = data.shape[1], data.shape[2]
+        flat = data.reshape(bands, -1).T
+        mask_valid = np.all(np.isfinite(flat), axis=1)
+        flat_valid = flat[mask_valid]
+
+        if progress:
+            progress(1, 4, "Classifying pixels")
+        proba = rf.predict_proba(flat_valid)
+        class_idx = np.argmax(proba, axis=1)
+        classes = le.inverse_transform(class_idx)
+
+        class_map = np.full(flat.shape[0], -1, dtype=np.int32)
+        class_map[mask_valid] = class_idx
+        class_map = class_map.reshape(height, width)
+
+        prob_bands = np.zeros((len(le.classes_), height, width), dtype=np.float32)
+        for k in range(len(le.classes_)):
+            band_flat = np.zeros(flat.shape[0], dtype=np.float32)
+            band_flat[mask_valid] = proba[:, k]
+            prob_bands[k] = band_flat.reshape(height, width)
+
+        # Label connected components per class to avoid merging different classes
+        label_map = np.zeros_like(class_map, dtype=np.int32)
+        label_counter = 1
+        label_class: dict[int, str] = {}
+        for idx_cls, cls_name in enumerate(le.classes_):
+            mask_cls = class_map == idx_cls
+            lbl, num = ndimage.label(mask_cls)
+            if num <= 0:
+                continue
+            lbl = lbl.astype(np.int32)
+            lbl[lbl > 0] += label_counter
+            label_class.update({int(label_counter + i): str(cls_name) for i in range(1, num + 1)})
+            label_map += lbl
+            label_counter += num
+
+        max_label = int(label_map.max())
+        if progress:
+            progress(2, 4, "Aggregating")
+        records: list[dict[str, Any]] = []
+        if max_label == 0:
+            raise RuntimeError("No labeled components found during vectorization.")
+
+        # Flatten for fast bincount aggregation
+        label_flat = label_map.reshape(-1)
+        valid_mask = label_flat > 0
+        labels_valid = label_flat[valid_mask]
+        counts = np.bincount(labels_valid, minlength=max_label + 1)
+
+        prob_means: dict[int, dict[str, float]] = {}
+        for idx_k, cls_k in enumerate(le.classes_):
+            weights = prob_bands[idx_k].reshape(-1)[valid_mask]
+            sums = np.bincount(labels_valid, weights=weights, minlength=max_label + 1)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                means = np.where(counts > 0, sums / counts, 0.0)
+            for lbl_id in range(1, max_label + 1):
+                if counts[lbl_id] <= 0:
+                    continue
+                prob_means.setdefault(lbl_id, {})[str(cls_k)] = float(means[lbl_id])
+
+        pixel_area_m2 = abs(float(transform.a) * float(transform.e)) if transform else 1.0
+        pixel_area_m2 = pixel_area_m2 if pixel_area_m2 > 0 else 1.0
+        pixel_area_cm2 = pixel_area_m2 * 10000.0
+        biomass_per_pixel = float(np.asarray(biomass_from_area_cm2(pixel_area_cm2, biomass_model, biomass_formula)).item()) if biomass_from_area_cm2 else 0.0
+        rate = max(0.0, float(growth_rate_pct) / 100.0 if growth_rate_pct is not None else 0.0)
+        sd_rate = max(0.0, float(growth_rate_sd) / 100.0 if growth_rate_sd is not None else 0.0)
+
+        if progress:
+            progress(3, 4, "Vectorizing shapes")
+        shapes_iter = rasterio.features.shapes(label_map, mask=(label_map > 0), transform=transform)
+        used_fields: set[str] = set()
+        class_field_map: dict[str, str] = {str(cls): _sanitize_field_name(f"p_{cls}", used_fields) for cls in le.classes_}
+
+        for geom, val in shapes_iter:
+            lbl_id = int(val)
+            if lbl_id <= 0 or counts[lbl_id] <= 0:
+                continue
+            rec: dict[str, Any] = {}
+            rec["geometry"] = shapely_shape(geom)
+            cls_name = label_class.get(lbl_id, "unknown")
+            rec["rf_class"] = cls_name
+            pix_count = int(counts[lbl_id])
+            rec["pixel_count"] = pix_count
+            rec["area_m2"] = float(pix_count * pixel_area_m2)
+            rec["area_cm2"] = float(pix_count * pixel_area_cm2)
+            # Infer AOI/plot id from the rasterized AOI mask
+            if aoi_id_grid is not None:
+                mask_poly = rasterio.features.geometry_mask([geom], out_shape=(height, width), transform=transform, invert=True)
+                ids = aoi_id_grid[mask_poly]
+                ids = ids[ids > 0]
+                if ids.size > 0:
+                    plot_val = int(np.bincount(ids).argmax())
+                    rec["plot_id"] = plot_val
+                    rec["AOI_ID"] = plot_val
+                else:
+                    rec["plot_id"] = 1
+                    rec["AOI_ID"] = 1
+            else:
+                rec["plot_id"] = 1
+                rec["AOI_ID"] = 1
+            means_for_lbl = prob_means.get(lbl_id, {})
+            for cls_k, fld_name in class_field_map.items():
+                rec[fld_name] = float(means_for_lbl.get(cls_k, 0.0))
+            rec["biomass_g"] = float(pix_count * biomass_per_pixel)
+            rec["biomass_t"] = rec["biomass_g"] / 1_000_000.0
+            rec["biomass_sd"] = rec["biomass_g"] * sd_rate
+            for day in range(1, 8):
+                rec[f"b_day{day}"] = rec["biomass_g"] * ((1 + rate) ** day)
+            records.append(rec)
+
+        gdf = gpd.GeoDataFrame(records, crs=src.crs)
+        if gdf.empty:
+            raise RuntimeError("No classified polygons produced.")
+        # Clip to AOI if provided
+        if aoi_path and os.path.exists(aoi_path):
+            try:
+                aoi_clip = gpd.read_file(aoi_path)
+                aoi_clip = aoi_clip.loc[~aoi_clip.geometry.is_empty].reset_index(drop=True)
+                if not aoi_clip.empty:
+                    gdf = gpd.overlay(gdf, aoi_clip[["geometry"]], how="intersection")
+            except Exception:
+                pass
+
+        # Shorten field names for shapefile compatibility
+        rename_map = {
+            "pixel_count": "pix_count",
+        }
+        gdf = gdf.rename(columns={k: v for k, v in rename_map.items() if k in gdf.columns})
+
+        out_path = folder / f"Pixel_RF_{ts}.shp"
+        gdf.to_file(out_path)
+
+        preview_path: Optional[Path] = None
+        if generate_preview and _build_classification_map is not None:
+            try:
+                preview_path = _build_classification_map(
+                    out_path,
+                    raster_path,
+                    mode="rf",
+                    aoi_path=aoi_path,
+                    biomass_model=biomass_model,
+                    biomass_formula=biomass_formula,
+                    growth_rate_pct=growth_rate_pct,
+                    growth_rate_sd=growth_rate_sd,
+                )
+            except Exception:
+                preview_path = None
+
+        return ApplyResult(
+            output_path=out_path,
+            duration_sec=time.time() - start,
+            preview_map=preview_path,
+        )
 
 
 def apply_model_with_pixel_sampling(
