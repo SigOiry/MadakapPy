@@ -515,7 +515,7 @@ def build_classification_map(
       for (let day = 1; day <= 7; day++) {
         const prevMean = mean[day - 1];
         const prevSd = sd[day - 1];
-        const nextMean = prevMean * (1 + rate);
+        const nextMean = prevMean + (prevMean * rate);
         const nextSd = Math.sqrt(Math.pow(prevSd * (1 + rate), 2) + Math.pow(prevMean * sdRate, 2));
         mean.push(nextMean);
         sd.push(nextSd);
