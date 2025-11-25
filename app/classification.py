@@ -39,6 +39,23 @@ except Exception:  # noqa: BLE001
         _build_classification_map = None
 
 
+def _safe_write_gdf(gdf: gpd.GeoDataFrame, path: Path) -> Path:
+    """
+    Write GeoDataFrame with a fallback when fiona/pyogrio are missing
+    (common in frozen executables).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        gdf.to_file(path)
+        return path
+    except Exception:
+        alt = path.with_suffix(".geojson")
+        alt.parent.mkdir(parents=True, exist_ok=True)
+        alt.write_text(gdf.to_json(), encoding="utf-8")
+        return alt
+
+
 Progress = Callable[[int, int, str], None]
 
 
@@ -431,7 +448,7 @@ def apply_model_to_segments(
     folder = base_out / "Output" / f"2-RF/Run_{ts}" if base_out.name.lower() != "output" else base_out / f"2-RF/Run_{ts}"
     folder.mkdir(parents=True, exist_ok=True)
     out_path = folder / f"Classification_{ts}.shp"
-    out_gdf.to_file(out_path)
+    out_path = _safe_write_gdf(out_gdf, out_path)
     return ApplyResult(output_path=out_path, duration_sec=0.0)
 
 
@@ -649,7 +666,7 @@ def apply_model_pixelwise(
         gdf = gdf.rename(columns={k: v for k, v in rename_map.items() if k in gdf.columns})
 
         out_path = folder / f"Pixel_RF_{ts}.shp"
-        gdf.to_file(out_path)
+        out_path = _safe_write_gdf(gdf, out_path)
 
         preview_path: Optional[Path] = None
         if generate_preview and _build_classification_map is not None:
@@ -910,7 +927,7 @@ def apply_model_with_pixel_sampling(
     keep_cols.append("geometry")
     gdf = gdf[keep_cols]
     out_path = folder / f"Classification_{ts}.shp"
-    gdf.to_file(out_path)
+    out_path = _safe_write_gdf(gdf, out_path)
     preview_path: Optional[Path] = None
     if generate_preview and _build_classification_map is not None:
         try:

@@ -102,6 +102,20 @@ def _ensure_plot_id(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf
 
 
+def _safe_read_vector(path: Path) -> gpd.GeoDataFrame:
+    try:
+        return gpd.read_file(path)
+    except Exception:
+        if path.suffix.lower() in {".geojson", ".json"}:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                feats = data.get("features", []) if isinstance(data, dict) else []
+                return gpd.GeoDataFrame.from_features(feats)
+            except Exception:
+                pass
+        raise
+
+
 def _areas_by_feature(
     gdf_main: gpd.GeoDataFrame, aoi: gpd.GeoDataFrame | None, project_crs: object | None
 ) -> np.ndarray:
@@ -250,7 +264,7 @@ def build_classification_map(
     out_path = shp_path.with_name(f"{shp_path.stem}_map.html")
 
     try:
-        gdf = gpd.read_file(shp_path)
+        gdf = _safe_read_vector(shp_path)
         gdf = gdf.loc[~gdf.geometry.is_empty].copy()
         if gdf.empty:
             raise RuntimeError("Classification output contains no geometries.")
@@ -279,7 +293,7 @@ def build_classification_map(
         aoi_gdf = None
         if aoi_path and aoi_path.exists():
             try:
-                aoi_gdf = gpd.read_file(aoi_path)
+                aoi_gdf = _safe_read_vector(aoi_path)
                 aoi_gdf = aoi_gdf.loc[~aoi_gdf.geometry.is_empty].copy()
                 if not aoi_gdf.empty:
                     aoi_gdf = _ensure_plot_id(aoi_gdf)

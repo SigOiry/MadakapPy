@@ -111,7 +111,7 @@ def run_flet_app() -> None:
             def build(self) -> ft.Control:
                 pal = _palette()
                 self._chevron = ft.Icon(
-                    name=ft.icons.KEYBOARD_ARROW_DOWN if self._expanded else ft.icons.KEYBOARD_ARROW_RIGHT,
+                    name="keyboard_arrow_down" if self._expanded else "keyboard_arrow_right",
                     color=pal["muted"],
                 )
                 header_controls = [self._title]
@@ -155,7 +155,7 @@ def run_flet_app() -> None:
                     self._body.visible = self._expanded
                 if self._chevron is not None:
                     self._chevron.name = (
-                        ft.icons.KEYBOARD_ARROW_DOWN if self._expanded else ft.icons.KEYBOARD_ARROW_RIGHT
+                        "keyboard_arrow_down" if self._expanded else "keyboard_arrow_right"
                     )
                 self.update()
 
@@ -546,9 +546,25 @@ def run_flet_app() -> None:
         except Exception:
             return None
 
+    def _launch_map_in_client(page_obj: "ft.Page", path: str | Path) -> None:
+        """Open a local HTML map in the user's browser (works for web builds too)."""
+        url = Path(path).resolve().as_uri()
+        def _open():
+            try:
+                page_obj.launch_url(url, web_window_name="_blank")
+            except Exception:
+                try:
+                    page_obj.launch_url(url)
+                except Exception:
+                    pass
+        try:
+            page_obj.call_from_thread(_open)
+        except Exception:
+            _open()
+
     def main(page: ft.Page):
         pal = _palette()
-        page.title = "Madakappy â€“ Seaweed Mapping Suite"
+        page.title = "Madakappy - Seaweed Mapping Suite"
         page.theme_mode = ft.ThemeMode.LIGHT
         # Normalize title to plain ASCII to avoid encoding artifacts
         page.title = "Madakappy - Seaweed Mapping Suite"
@@ -638,6 +654,45 @@ def run_flet_app() -> None:
             visible=False,
             disabled=True,
         )
+        preview_state: dict[str, Optional[str]] = {"pre": None, "result": None}
+        open_pre_map_btn = ft.ElevatedButton(
+            "Open preselection map",
+            icon="map",
+            visible=False,
+            disabled=True,
+        )
+        open_result_map_btn = ft.ElevatedButton(
+            "Open result map",
+            icon="map",
+            visible=False,
+            disabled=True,
+        )
+
+        def _set_preview_button(kind: str, path: Optional[str]) -> None:
+            def _apply():
+                btn = open_pre_map_btn if kind == "pre" else open_result_map_btn
+                preview_state[kind] = path
+                btn.visible = bool(path)
+                btn.disabled = path is None
+                btn.tooltip = path or ""
+                _safe_update(btn)
+            try:
+                page.call_from_thread(_apply)
+            except Exception:
+                _apply()
+
+        def on_open_pre_map(_=None) -> None:
+            pth = preview_state.get("pre")
+            if pth:
+                _launch_map_in_client(page, pth)
+
+        def on_open_result_map(_=None) -> None:
+            pth = preview_state.get("result")
+            if pth:
+                _launch_map_in_client(page, pth)
+
+        open_pre_map_btn.on_click = on_open_pre_map
+        open_result_map_btn.on_click = on_open_result_map
 
         history_state: dict[str, Any] = {"records": [], "selected_id": None, "current_root": None}
         history_hint = ft.Text("", size=12, color=pal["muted"])
@@ -657,7 +712,7 @@ def run_flet_app() -> None:
                 tiles.append(
                     ft.ListTile(
                         title=ft.Text("No runs saved yet.", color=pal["muted"]),
-                        leading=ft.Icon(ft.icons.INBOX, color=pal["muted"]),
+                        leading=ft.Icon("inbox", color=pal["muted"]),
                     )
                 )
             else:
@@ -671,7 +726,7 @@ def run_flet_app() -> None:
                             title=ft.Text(title),
                             subtitle=ft.Text(subtitle) if subtitle else None,
                             on_click=lambda e, rid=rid: select_history_record(rid),
-                            trailing=ft.Icon(ft.icons.MAP, color=pal["muted"]),
+                            trailing=ft.Icon("map", color=pal["muted"]),
                         )
                     )
             history_list.controls = tiles
@@ -830,23 +885,20 @@ def run_flet_app() -> None:
                 elif kind == "preview":
                     pth = msg.get("path")
                     if pth:
-                        # Try to open in the default browser
-                        try:
-                            page.launch_url("file:///" + str(Path(pth).resolve()).replace("\\", "/"))
-                        except Exception:
-                            pass
-                        # Also show a lightweight dialog with an Open Again action
+                        url = "file:///" + str(Path(pth).resolve()).replace("\\", "/")
                         def _open_again(_: object | None = None):
                             try:
-                                page.launch_url("file:///" + str(Path(pth).resolve()).replace("\\", "/"))
+                                page.launch_url(url)
                             except Exception:
                                 pass
+                        # Attempt to open automatically, but always show a dialog with a button
+                        _open_again()
                         dlg = ft.AlertDialog(
                             modal=True,
                             title=ft.Text("Preselection preview"),
-                            content=ft.Text(f"Opened map in your browser.\n{pth}"),
+                            content=ft.Text(f"Preview map is ready.\n{pth}"),
                             actions=[
-                                ft.TextButton("Open Again", on_click=_open_again),
+                                ft.TextButton("Open", on_click=_open_again),
                                 ft.TextButton("Close", on_click=lambda e: (setattr(dlg, "open", False), page.update())),
                             ],
                         )
@@ -855,18 +907,19 @@ def run_flet_app() -> None:
                 elif kind == "classification_preview":
                     pth = msg.get("path")
                     if pth:
+                        url = "file:///" + str(Path(pth).resolve()).replace("\\", "/")
                         def _open_preview(_=None):
                             try:
-                                page.launch_url("file:///" + str(Path(pth).resolve()).replace("\\", "/"))
+                                page.launch_url(url)
                             except Exception:
                                 pass
                         _open_preview()
                         dlg = ft.AlertDialog(
                             modal=True,
                             title=ft.Text("Classification preview"),
-                            content=ft.Text(f"Opened map in your browser.\n{pth}"),
+                            content=ft.Text(f"Preview map is ready.\n{pth}"),
                             actions=[
-                                ft.TextButton("Open Again", on_click=lambda e: _open_preview()),
+                                ft.TextButton("Open", on_click=lambda e: _open_preview()),
                                 ft.TextButton("Close", on_click=lambda e: (setattr(dlg, "open", False), page.update())),
                             ],
                         )
@@ -973,6 +1026,7 @@ def run_flet_app() -> None:
             settings_snapshot = collect_run_settings()
             def worker():
                 try:
+                    _set_preview_button("pre", None)
                     if custom_path:
                         page.pubsub.send_all({"kind": "progress", "text": "Using custom AOI shapefile", "ratio": 0.0})
                         aoi_final = save_preselection_to_output(custom_path, output_dir.value.strip())
@@ -1007,7 +1061,9 @@ def run_flet_app() -> None:
                         result_msg = f"Preselection: {n_polys} polygons\nSaved: {aoi_final}"
                     path = build_preview_html(aoi_final, in_raster.value.strip())
                     if path:
+                        _launch_map_in_client(page, path)
                         page.pubsub.send_all({"kind": "preview", "path": path})
+                        _set_preview_button("pre", path)
                     page.pubsub.send_all({"kind":"result","text": result_msg})
                 except Exception as ex:  # noqa: BLE001
                     page.pubsub.send_all({"kind":"result","text": f"Preselection failed: {ex}"})
@@ -1032,6 +1088,8 @@ def run_flet_app() -> None:
             settings_snapshot = collect_run_settings()
             def worker():
                 try:
+                    _set_preview_button("pre", None)
+                    _set_preview_button("result", None)
                     bio_model = (
                         (settings_snapshot.get("classification") or {}).get("biomass_model") or "madagascar"
                     )
@@ -1175,7 +1233,9 @@ def run_flet_app() -> None:
                         except Exception:
                             preview_path = None
                         if preview_path:
+                            _launch_map_in_client(page, preview_path)
                             page.pubsub.send_all({"kind": "classification_preview", "path": str(preview_path)})
+                            _set_preview_button("result", str(preview_path))
                         if result_output_path:
                             completed = datetime.now()
                             label = completed.strftime("%Y-%m-%d %H:%M:%S")
@@ -1208,11 +1268,11 @@ def run_flet_app() -> None:
                     page.pubsub.send_all({"kind":"result","text": f"Workflow failed: {ex}"})
             threading.Thread(target=worker, daemon=True).start()
 
-        # Layout â€“ Project Paths (neutral)
+        # Layout - Project Paths (neutral)
         left = section(
             "Project Paths",
-            labeled_row("Input raster", ft.Row([in_raster, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_raster.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.IMAGE_OUTLINED, tip="Path to input imagery (GeoTIFF)."),
-            labeled_row("Output directory", ft.Row([output_dir, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: dp_output.get_directory_path())], expand=True), icon=ft.icons.FOLDER, tip="Folder where results will be written."),
+            labeled_row("Input raster", ft.Row([in_raster, ft.OutlinedButton("Browse", icon="folder_open", on_click=lambda _: fp_raster.pick_files(allow_multiple=False))], expand=True), icon="image_outlined", tip="Path to input imagery (GeoTIFF)."),
+            labeled_row("Output directory", ft.Row([output_dir, ft.OutlinedButton("Browse", icon="folder_open", on_click=lambda _: dp_output.get_directory_path())], expand=True), icon="folder", tip="Folder where results will be written."),
             labeled_row(
                 "Custom AOI (.shp)",
                 ft.Row(
@@ -1220,14 +1280,14 @@ def run_flet_app() -> None:
                         custom_aoi,
                         ft.OutlinedButton(
                             "Browse",
-                            icon=ft.icons.MAP,
+                            icon="map",
                             on_click=lambda _: fp_custom_aoi.pick_files(allow_multiple=False),
                         ),
                     ],
                     spacing=6,
                     expand=True,
                 ),
-                icon=ft.icons.MAP,
+                icon="map",
                 tip="Optional shapefile used as the AOI. When set, preselection is skipped and this file opens in the editor.",
             ),
             subtitle="Set inputs and outputs.",
@@ -1240,15 +1300,15 @@ def run_flet_app() -> None:
             ft.Text("Set the expected plot sizes (meters). Leave max fields empty if unknown.", color=pal["muted"]),
             ft.Row(
                 [
-                    labeled_row("Min width (m)", pre_wmin, icon=ft.icons.UNFOLD_MORE, tip="Plots narrower than this are ignored when estimating orientation or merging."),
-                    labeled_row("Max width (m)", pre_wmax, icon=ft.icons.UNFOLD_MORE, tip="Optional ceiling for plot width."),
+                    labeled_row("Min width (m)", pre_wmin, icon="unfold_more", tip="Plots narrower than this are ignored when estimating orientation or merging."),
+                    labeled_row("Max width (m)", pre_wmax, icon="unfold_more", tip="Optional ceiling for plot width."),
                 ],
                 wrap=True,
             ),
             ft.Row(
                 [
-                    labeled_row("Min length (m)", pre_lmin, icon=ft.icons.SPACE_BAR, tip="Minimum expected plot length."),
-                    labeled_row("Max length (m)", pre_lmax, icon=ft.icons.SPACE_BAR, tip="Optional ceiling for plot length."),
+                    labeled_row("Min length (m)", pre_lmin, icon="space_bar", tip="Minimum expected plot length."),
+                    labeled_row("Max length (m)", pre_lmax, icon="space_bar", tip="Optional ceiling for plot length."),
                 ],
                 wrap=True,
             ),
@@ -1257,7 +1317,7 @@ def run_flet_app() -> None:
                     labeled_row(
                         "Small-plot buffer (m)",
                         pre_small_buffer,
-                        icon=ft.icons.CROP_FREE,
+                        icon="crop_free",
                         tip="Undersized polygons are buffered by this amount before merging so they can fuse with neighbours.",
                     ),
                 ],
@@ -1353,7 +1413,7 @@ def run_flet_app() -> None:
 
         def update_model_hint() -> None:
             if (classifier_mode.value or "rf") == "stats":
-                model_hint.value = "Statistics mode enabled – Random Forest controls are disabled."
+                model_hint.value = "Statistics mode enabled - Random Forest controls are disabled."
             else:
                 model_hint.value = model_hint_state["text"]
             _safe_update(model_hint)
@@ -1423,16 +1483,16 @@ def run_flet_app() -> None:
                 train_info.value = "Could not read fields."
                 page.update()
 
-        refresh_btn = ft.IconButton(icon=ft.icons.REFRESH, tooltip="Rescan Model directory", on_click=refresh_model_list)
+        refresh_btn = ft.IconButton(icon="refresh", tooltip="Rescan Model directory", on_click=refresh_model_list)
         rf_controls.extend([model_path, refresh_btn, max_pixels_per_polygon])
-        train_tab_btn = ft.TextButton("Need to train a model? Open the Train Model tab →", on_click=switch_to_training_tab)
+        train_tab_btn = ft.TextButton("Need to train a model? Open the Train Model tab", on_click=switch_to_training_tab)
         rf_controls.append(train_tab_btn)
         clf = section(
             "Classification",
             labeled_row(
                 "Method",
                 classifier_mode,
-                icon=ft.icons.TUNE,
+                icon="tune",
                 tip="Pick Random Forest (requires a trained model) or the statistics-based classifier.",
             ),
             labeled_row(
@@ -1445,14 +1505,14 @@ def run_flet_app() -> None:
                     spacing=8,
                     expand=True,
                 ),
-                icon=ft.icons.SAVE_ALT,
+                icon="save_alt",
                 tip="Select a trained classifier stored under the Model directory.",
             ),
             model_hint,
             labeled_row(
                 "Pixels/polygon (prediction)",
                 max_pixels_per_polygon,
-                icon=ft.icons.SPEED,
+                icon="speed",
                 tip="Number of pixels sampled in each polygon when applying the model.",
             ),
             train_tab_btn,
@@ -1464,19 +1524,19 @@ def run_flet_app() -> None:
             labeled_row(
                 "Mode",
                 biomass_mode,
-                icon=ft.icons.SCIENCE,
+                icon="science",
                 tip="Switch between presets and your own biomass equation.",
             ),
             labeled_row(
                 "Preset model",
                 biomass_model,
-                icon=ft.icons.BIOTECH,
+                icon="biotech",
                 tip="Built-in biomass-area relationships.",
             ),
             labeled_row(
                 "Biomass (g) =",
                 biomass_formula,
-                icon=ft.icons.FORMAT_COLOR_TEXT,
+                icon="format_color_text",
                 tip="Enter biomass (g) = f(x) with x as plot area (cm^2).",
             ),
             ft.Row(
@@ -1484,13 +1544,13 @@ def run_flet_app() -> None:
                     labeled_row(
                         "Growth rate",
                         growth_rate,
-                        icon=ft.icons.TRENDING_UP,
+                        icon="trending_up",
                         tip="Daily growth rate (%) used to project biomass for the next 7 days.",
                     ),
                     labeled_row(
                         "Std. dev.",
                         growth_sd,
-                        icon=ft.icons.SHOW_CHART,
+                        icon="show_chart",
                         tip="Standard deviation for the growth rate (stored for reference).",
                     ),
                 ],
@@ -1536,7 +1596,7 @@ def run_flet_app() -> None:
             def progress_cb(done: int, total: int, note: str = "") -> None:
                 label = "Training"
                 if note:
-                    label = f"{label} – {note}"
+                    label = f"{label} - {note}"
                 ratio = (done / max(1, total)) if total else 0.0
                 page.pubsub.send_all({"kind": "progress", "text": label, "ratio": ratio})
 
@@ -1585,14 +1645,14 @@ def run_flet_app() -> None:
                         train_image,
                         ft.OutlinedButton(
                             "Browse",
-                            icon=ft.icons.IMAGE_OUTLINED,
+                            icon="image_outlined",
                             on_click=lambda _: fp_train_image.pick_files(allow_multiple=False),
                         ),
                     ],
                     spacing=6,
                     expand=True,
                 ),
-                icon=ft.icons.IMAGE_OUTLINED,
+                icon="image_outlined",
                 tip="Raster used to sample per-pixel spectra for training.",
             ),
             labeled_row(
@@ -1602,15 +1662,15 @@ def run_flet_app() -> None:
                         train_polys,
                         ft.OutlinedButton(
                             "Browse",
-                            icon=ft.icons.FOLDER_OPEN,
+                            icon="folder_open",
                             on_click=lambda _: fp_train.pick_files(allow_multiple=False),
                         ),
-                        ft.OutlinedButton("Load Fields", icon=ft.icons.TABLE_VIEW, on_click=load_fields),
+                        ft.OutlinedButton("Load Fields", icon="table_view", on_click=load_fields),
                     ],
                     spacing=6,
                     expand=True,
                 ),
-                icon=ft.icons.MAP_OUTLINED,
+                icon="map_outlined",
                 tip="Vector dataset containing class labels.",
             ),
             ft.Row(
@@ -1618,13 +1678,13 @@ def run_flet_app() -> None:
                     labeled_row(
                         "Class column",
                         class_column,
-                        icon=ft.icons.LIST_ALT,
+                        icon="list_alt",
                         tip="Attribute containing the class name.",
                     ),
                     labeled_row(
                         "Max pixels/class",
                         max_pixels_per_class,
-                        icon=ft.icons.SPEED,
+                        icon="speed",
                         tip="Classes exceeding this limit are randomly down-sampled (0 = no cap).",
                     ),
                 ],
@@ -1639,12 +1699,12 @@ def run_flet_app() -> None:
             subtitle="Train a new model from labeled polygons.",
             bgcolor=pal["alt"],
         )
-        train_btn = ft.ElevatedButton("Train Model", icon=ft.icons.SCIENCE, on_click=on_train_model)
+        train_btn = ft.ElevatedButton("Train Model", icon="science", on_click=on_train_model)
 
         # Footer / actions
-        pre_btn = ft.ElevatedButton("Run Preselection", icon=ft.icons.SEARCH, on_click=lambda _: run_preselection_only())
+        pre_btn = ft.ElevatedButton("Run Preselection", icon="search", on_click=lambda _: run_preselection_only())
         pre_button_ref["btn"] = pre_btn
-        run_btn = ft.ElevatedButton("Run Workflow", icon=ft.icons.PLAY_ARROW, on_click=run_workflow)
+        run_btn = ft.ElevatedButton("Run Workflow", icon="play_arrow", on_click=run_workflow)
         sync_preselection_state()
 
         # Two-column responsive layout: each section ~half width
@@ -1694,13 +1754,20 @@ def run_flet_app() -> None:
         )
 
         result_panel = ft.Column(
-            [result_text, confirm_btn],
+            [
+                result_text,
+                confirm_btn,
+                ft.Row(
+                    [open_pre_map_btn, open_result_map_btn],
+                    spacing=10,
+                ),
+            ],
             spacing=6,
             horizontal_alignment=ft.CrossAxisAlignment.START,
         )
 
         history_refresh_btn = ft.IconButton(
-            icon=ft.icons.REFRESH,
+            icon="refresh",
             tooltip="Reload saved runs",
             on_click=refresh_history_panel,
         )
@@ -1741,7 +1808,7 @@ def run_flet_app() -> None:
                 ],
                 spacing=10,
             ),
-            icon=ft.icons.HISTORY,
+            icon="history",
             subtitle="Select a processed run to review its settings and reopen the map.",
             bgcolor=pal["card"],
             expanded=True,
@@ -1784,13 +1851,58 @@ def run_flet_app() -> None:
         refresh_history_panel()
 
     import flet as ft  # type: ignore
-    ft.app(target=main, assets_dir="assets", view=ft.WEB_BROWSER)
+    # Ensure icons namespace exists (some builds may not ship ft.icons)
+    if not hasattr(ft, "icons"):
+        import types
+        _icon_map = {
+            "KEYBOARD_ARROW_DOWN": "keyboard_arrow_down",
+            "KEYBOARD_ARROW_RIGHT": "keyboard_arrow_right",
+            "INBOX": "inbox",
+            "MAP": "map",
+            "MAP_OUTLINED": "map_outlined",
+            "FOLDER_OPEN": "folder_open",
+            "IMAGE_OUTLINED": "image_outlined",
+            "FOLDER": "folder",
+            "UNFOLD_MORE": "unfold_more",
+            "SPACE_BAR": "space_bar",
+            "CROP_FREE": "crop_free",
+            "REFRESH": "refresh",
+            "TUNE": "tune",
+            "SAVE_ALT": "save_alt",
+            "SPEED": "speed",
+            "SCIENCE": "science",
+            "BIOTECH": "biotech",
+            "FORMAT_COLOR_TEXT": "format_color_text",
+            "TRENDING_UP": "trending_up",
+            "SHOW_CHART": "show_chart",
+            "TABLE_VIEW": "table_view",
+            "LIST_ALT": "list_alt",
+            "SEARCH": "search",
+            "PLAY_ARROW": "play_arrow",
+            "HISTORY": "history",
+        }
+        ft.icons = types.SimpleNamespace(**_icon_map)  # type: ignore[attr-defined]
+    else:
+        try:
+            from flet import icons as _icons  # type: ignore
+            ft.icons = _icons  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    # Launch in native window so local pickers work
+    try:
+        _app_view = getattr(ft, "AppView", None)
+        if _app_view is not None and hasattr(_app_view, "FLET_APP"):
+            ft.app(target=main, assets_dir="assets", view=_app_view.FLET_APP)
+        elif hasattr(ft, "FLET_APP"):
+            ft.app(target=main, assets_dir="assets", view=ft.FLET_APP)
+        else:
+            ft.app(target=main, assets_dir="assets")
+    except Exception:
+        ft.app(target=main, assets_dir="assets")
 
 
 if __name__ == "__main__":
     run_flet_app()
-
-
 
 
 
