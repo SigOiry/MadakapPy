@@ -1784,7 +1784,7 @@ def run_flet_app() -> None:
         refresh_history_panel()
 
     import flet as ft  # type: ignore
-    ft.app(target=main)
+    ft.app(target=main, assets_dir="assets", view=ft.WEB_BROWSER)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,0 @@
-OTB Version: 9.0.0
-Build Date: 2023-12-21T02:55:26
-otb.git repository info: 
- git log -1 --oneline     = [55f5dde PKG: modify OTBModuleAPI] 
- git symbolic-ref -q HEAD = 

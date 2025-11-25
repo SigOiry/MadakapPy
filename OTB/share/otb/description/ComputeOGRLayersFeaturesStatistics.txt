@@ -1,6 +1,0 @@
-ComputeOGRLayersFeaturesStatistics
-Compute statistics of the features in a set of OGR Layers
-Segmentation
-QgsProcessingParameterVectorLayer|inshp|Vector Data|-1|None|False
-QgsProcessingParameterFileDestination|outstats|Output XML file|None|None|False
-QgsProcessingParameterField|feat|Feature|None|inshp|QgsProcessingParameterField.Any|True|True
