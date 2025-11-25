@@ -913,7 +913,6 @@ def run_flet_app() -> None:
                                 page.launch_url(url)
                             except Exception:
                                 pass
-                        _open_preview()
                         dlg = ft.AlertDialog(
                             modal=True,
                             title=ft.Text("Classification preview"),
