@@ -462,6 +462,7 @@ def apply_model_pixelwise(
     model_path: str | os.PathLike,
     output_root: str | os.PathLike,
     aoi_path: str | os.PathLike | None = None,
+    aoi_id: int | None = None,
     biomass_model: str = "madagascar",
     biomass_formula: str | None = None,
     growth_rate_pct: float = 5.8,
@@ -616,21 +617,8 @@ def apply_model_pixelwise(
             rec["pixel_count"] = pix_count
             rec["area_m2"] = float(pix_count * pixel_area_m2)
             rec["area_cm2"] = float(pix_count * pixel_area_cm2)
-            # Infer AOI/plot id from the rasterized AOI mask
-            if aoi_id_grid is not None:
-                mask_poly = rasterio.features.geometry_mask([geom], out_shape=(height, width), transform=transform, invert=True)
-                ids = aoi_id_grid[mask_poly]
-                ids = ids[ids > 0]
-                if ids.size > 0:
-                    plot_val = int(np.bincount(ids).argmax())
-                    rec["plot_id"] = plot_val
-                    rec["AOI_ID"] = plot_val
-                else:
-                    rec["plot_id"] = 1
-                    rec["AOI_ID"] = 1
-            else:
-                rec["plot_id"] = 1
-                rec["AOI_ID"] = 1
+            rec["plot_id"] = int(aoi_id) if aoi_id is not None else 1
+            rec["AOI_ID"] = rec["plot_id"]
             means_for_lbl = prob_means.get(lbl_id, {})
             for cls_k, fld_name in class_field_map.items():
                 rec[fld_name] = float(means_for_lbl.get(cls_k, 0.0))

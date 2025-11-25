@@ -18,12 +18,10 @@ def run_flet_app() -> None:
 
     # Local imports (avoid heavy deps until UI launches)
     from .predetection import detect_cultivation_plots, save_preselection_to_output
-    from .segmentation import run_segmentation
     from .classification import (
         train_model_from_training_polys,
-        apply_model_with_pixel_sampling,
+        apply_model_pixelwise,
     )
-    from .simple_classifier import classify_dark_linear_polygons
     from .map_preview import build_classification_map
     import numpy as np
     import pandas as pd
@@ -571,11 +569,8 @@ def run_flet_app() -> None:
         # Inputs
         default_in = str((Path("Data") / "All_cropped.tif").resolve())
         default_out = str((Path.cwd() / "Output").resolve())
-        default_otb = str(Path("OTB") / "bin" / "otbcli_LargeScaleMeanShift.bat")
-
         in_raster = ft.TextField(value=default_in, expand=True)
         output_dir = ft.TextField(value=default_out, expand=True)
-        otb_bin = ft.TextField(value=default_otb, expand=True)
         custom_aoi = ft.TextField(value="", expand=True, hint_text="Optional AOI shapefile (.shp)")
         train_image = ft.TextField(value=default_in, expand=True, hint_text="Training image (GeoTIFF)")
 
@@ -787,11 +782,6 @@ def run_flet_app() -> None:
                 "blue_quantile": float(pre_quantile.value or 0.0),
                 "enabled": not bool(_clean(custom_aoi)),
             }
-            seg_vals = {
-                "tile_size_m": _field_int(tile_size, 40),
-                "spatialr": _field_int(spatialr, 5),
-                "minsize": _field_int(minsize, 5),
-            }
             bio_mode = (biomass_mode.value or "preset")
             bio_formula_val = (biomass_formula.value or "").strip()
             bio_model_val = (biomass_model.value or "madagascar")
@@ -822,11 +812,9 @@ def run_flet_app() -> None:
             return {
                 "input_raster": _clean(in_raster),
                 "output_dir": _clean(output_dir),
-                "otb_path": _clean(otb_bin),
                 "custom_aoi": _clean(custom_aoi),
                 "aoi_source": "custom" if _clean(custom_aoi) else "preselection",
                 "preselection": pre_vals,
-                "segmentation": seg_vals,
                 "classification": clf_vals,
                 "training": train_vals,
             }
@@ -945,12 +933,6 @@ def run_flet_app() -> None:
                     refresh_history_panel()
             except Exception:
                 pass
-        def on_pick_otb(e: ft.FilePickerResultEvent):
-            try:
-                if e.files:
-                    otb_bin.value = e.files[0].path; otb_bin.update()
-            except Exception:
-                pass
         def on_pick_custom_aoi(e: ft.FilePickerResultEvent):
             try:
                 if e.files:
@@ -968,12 +950,11 @@ def run_flet_app() -> None:
                 pass
         fp_raster = ft.FilePicker(on_result=on_pick_raster)
         dp_output = ft.FilePicker(on_result=on_pick_output)
-        fp_otb = ft.FilePicker(on_result=on_pick_otb)
         fp_custom_aoi = ft.FilePicker(on_result=on_pick_custom_aoi)
         fp_train_image = ft.FilePicker(on_result=on_pick_train_image)
         # Classification pickers (defined later)
         fp_train = ft.FilePicker()
-        page.overlay.extend([fp_raster, dp_output, fp_otb, fp_custom_aoi, fp_train, fp_train_image])
+        page.overlay.extend([fp_raster, dp_output, fp_custom_aoi, fp_train, fp_train_image])
 
         # Actions
         def run_preselection_only():
@@ -1037,10 +1018,9 @@ def run_flet_app() -> None:
             confirm_btn.disabled = True
             workflow_gate["event"] = None
             page.update()
-            if not in_raster.value.strip() or not output_dir.value.strip() or not os.path.exists(otb_bin.value.strip()):
-                step_text.value = "Set input raster, output directory and a valid OTB path"; page.update(); return
-            mode_sel = (classifier_mode.value or "rf")
-            if mode_sel == "rf" and not (model_path.value or "").strip():
+            if not in_raster.value.strip() or not output_dir.value.strip():
+                step_text.value = "Set input raster and output directory"; page.update(); return
+            if not (model_path.value or "").strip():
                 step_text.value = "Select a model before running the workflow"
                 page.update()
                 return
@@ -1058,7 +1038,7 @@ def run_flet_app() -> None:
                     bio_formula = (settings_snapshot.get("classification") or {}).get("biomass_formula")
                     growth_rate_val = float((settings_snapshot.get("classification") or {}).get("growth_rate_pct", 5.8))
                     growth_sd_val = float((settings_snapshot.get("classification") or {}).get("growth_rate_sd", 0.7))
-                    mode_local = mode_sel
+                    mode_local = "rf"
                     # Preselection first
                     custom_path_local = custom_path
                     if custom_path_local:
@@ -1107,25 +1087,11 @@ def run_flet_app() -> None:
                     confirm_event.wait()
                     workflow_gate["event"] = None
 
-                    # Parse segmentation parameters
-                    tile_sz = _field_int(tile_size, 40)
-                    spatial = _field_int(spatialr, 5)
-                    mins = _field_int(minsize, 5)
-
                     # Classification settings
-                    cap_pol = 200
-                    model_file = None
-                    if mode_local == "rf":
-                        try:
-                            cap_pol = int(max_pixels_per_polygon.value or "0")
-                        except Exception:
-                            cap_pol = 0
-                        cap_pol = max(1, cap_pol) if cap_pol else 200
-                        model_file = (model_path.value or "").strip()
-                        if not model_file or not os.path.exists(model_file):
-                            raise RuntimeError("Selected model file does not exist")
+                    model_file = (model_path.value or "").strip()
+                    if not model_file or not os.path.exists(model_file):
+                        raise RuntimeError("Selected model file does not exist")
 
-                    # Prepare AOI list
                     if not aoi_final or not os.path.exists(aoi_final):
                         raise RuntimeError("AOI file missing after preselection.")
                     aoi_gdf = gpd.read_file(aoi_final)
@@ -1140,8 +1106,7 @@ def run_flet_app() -> None:
                     shutil.rmtree(work_dir, ignore_errors=True)
                     work_dir.mkdir(parents=True, exist_ok=True)
 
-                    seg_frames: list[gpd.GeoDataFrame] = []
-                    seg_counter = 1
+                    temp_outputs: list[Path] = []
                     n_aoi = len(aoi_gdf)
                     for idx, geom in enumerate(aoi_gdf.geometry, start=1):
                         if geom is None or geom.is_empty:
@@ -1149,154 +1114,80 @@ def run_flet_app() -> None:
                         single = gpd.GeoDataFrame({"geometry": [geom]}, crs=aoi_gdf.crs)
                         single_path = work_dir / f"aoi_{idx}.shp"
                         single.to_file(single_path)
-
-                        page.pubsub.send_all(
-                            {"kind": "result", "text": f"AOI {idx}/{n_aoi}: running segmentation"}
-                        )
-                        seg_res = run_segmentation(
-                            in_raster=in_raster.value.strip(),
-                            output_root=str(work_dir / f"seg_run_{idx}"),
-                            otb_bin=otb_bin.value.strip(),
-                            tile_size_m=tile_sz,
-                            spatialr=spatial,
-                            minsize=mins,
+                        page.pubsub.send_all({"kind": "result", "text": f"AOI {idx}/{n_aoi}: classifying pixels"})
+                        res = apply_model_pixelwise(
+                            raster_path=in_raster.value.strip(),
+                            model_path=model_file,
+                            output_root=str(work_dir),
                             aoi_path=str(single_path),
+                            aoi_id=int(idx),
+                            biomass_model=bio_model,
+                            biomass_formula=bio_formula,
+                            growth_rate_pct=growth_rate_val,
+                            growth_rate_sd=growth_sd_val,
                             progress=lambda d, t, n, i=idx: page.pubsub.send_all(
                                 {
                                     "kind": "progress",
-                                    "text": f"Segmentation (AOI {i}/{n_aoi})",
+                                    "text": n or f"Classifying AOI {i}/{n_aoi}",
                                     "ratio": (0 if t == 0 else d / max(1, t)),
                                 }
                             ),
+                            generate_preview=False,
                         )
-                        final_seg_path = seg_res.out_shp
+                        temp_outputs.append(Path(res.output_path))
+
+                    merged_gdfs = []
+                    for shp in temp_outputs:
                         try:
-                            seg_gdf = gpd.read_file(final_seg_path)
-                            seg_gdf = seg_gdf.loc[~seg_gdf.geometry.is_empty].reset_index(drop=True)
-                            seg_len = len(seg_gdf)
-                            if seg_len > 0:
-                                drop_cols = [c for c in seg_gdf.columns if c.lower().startswith(("var", "mean"))]
-                                if drop_cols:
-                                    seg_gdf = seg_gdf.drop(columns=drop_cols, errors="ignore")
-                                seg_gdf["seg_id"] = np.arange(seg_counter, seg_counter + seg_len, dtype=np.int64)
-                                seg_gdf["plot_id"] = int(idx)
-                                try:
-                                    target_geom = (
-                                        single.to_crs(seg_gdf.crs).geometry.iloc[0]
-                                        if seg_gdf.crs and single.crs and str(seg_gdf.crs) != str(single.crs)
-                                        else single.geometry.iloc[0]
-                                    )
-                                except Exception:
-                                    target_geom = None
-                                if target_geom is not None:
-                                    try:
-                                        seg_gdf["plot_area"] = seg_gdf.geometry.intersection(target_geom).area
-                                    except Exception:
-                                        seg_gdf["plot_area"] = seg_gdf.geometry.area
-                                else:
-                                    seg_gdf["plot_area"] = seg_gdf.geometry.area
-                                seg_counter += seg_len
-                                seg_frames.append(seg_gdf)
-                        except Exception as seg_err:
-                            page.pubsub.send_all(
-                                {"kind": "result", "text": f"Warning: could not prepare segments for AOI {idx}: {seg_err}"}
-                            )
-                        page.pubsub.send_all(
-                            {"kind": "result", "text": f"AOI {idx}/{n_aoi}: segmentation complete"}
-                        )
+                            merged_gdfs.append(gpd.read_file(shp))
+                        except Exception as exc:
+                            page.pubsub.send_all({"kind": "result", "text": f"Warning: could not read {shp}: {exc}"})
+                    if not merged_gdfs:
+                        raise RuntimeError("No classification outputs to merge.")
+                    merged = gpd.GeoDataFrame(pd.concat(merged_gdfs, ignore_index=True), crs=merged_gdfs[0].crs if hasattr(merged_gdfs[0], "crs") else None)
+                    out_dir = base_out / "Output" if base_out.name.lower() != "output" else base_out
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    final_dir = out_dir / "PixelRF" / f"Run_{run_ts}"
+                    final_dir.mkdir(parents=True, exist_ok=True)
+                    final_path = final_dir / f"Pixel_RF_{run_ts}.shp"
+                    merged.to_file(final_path)
 
-                    if not seg_frames:
-                        raise RuntimeError("No segments produced for classification.")
-
-                    combined = gpd.GeoDataFrame(
-                        pd.concat(seg_frames, ignore_index=True),
-                        crs=seg_frames[0].crs if hasattr(seg_frames[0], "crs") else None,
-                    )
-                    combined_path = work_dir / "combined_segments.shp"
-                    combined.to_file(combined_path)
-
-                    page.pubsub.send_all({"kind": "result", "text": "Segments merged. Running classification..."})
+                    page.pubsub.send_all({"kind": "result", "text": "Running classification..."})
 
                     try:
                         preview_path = None
                         summary_text = ""
                         result_output_path: Optional[str] = None
-                        if mode_local == "rf":
-                            cls_res = apply_model_with_pixel_sampling(
+                        summary_text = f"Workflow complete. Classification saved to:\n{final_path}"
+                        result_output_path = str(final_path)
+                        page.pubsub.send_all({"kind": "result", "text": summary_text})
+                        try:
+                            preview_path = build_classification_map(
+                                final_path,
                                 in_raster.value.strip(),
-                                str(combined_path),
-                                model_file,
-                                output_dir.value.strip(),
-                                max_pixels_per_polygon=cap_pol,
-                                progress=lambda d, t, n: page.pubsub.send_all(
-                                    {
-                                        "kind": "progress",
-                                        "text": "Classifying",
-                                        "ratio": (0 if t == 0 else d / max(1, t)),
-                                    }
-                                ),
-                                generate_preview=True,
+                                mode="rf",
                                 aoi_path=aoi_final,
                                 biomass_model=bio_model,
                                 biomass_formula=bio_formula,
                                 growth_rate_pct=growth_rate_val,
                                 growth_rate_sd=growth_sd_val,
                             )
-                            summary_text = f"Workflow complete. Classification saved to:\n{cls_res.output_path}"
-                            result_output_path = str(cls_res.output_path)
-                            page.pubsub.send_all({"kind": "result", "text": summary_text})
-                            preview_path = cls_res.preview_map
-                        else:
-                            stats_res = classify_dark_linear_polygons(
-                                in_raster.value.strip(),
-                                str(combined_path),
-                                output_dir.value.strip(),
-                                biomass_model=bio_model,
-                                biomass_formula=bio_formula,
-                                growth_rate_pct=growth_rate_val,
-                                growth_rate_sd=growth_sd_val,
-                                progress=lambda d, t, n: page.pubsub.send_all(
-                                    {
-                                        "kind": "progress",
-                                        "text": n or "Statistics classifier",
-                                        "ratio": (0 if t == 0 else d / max(1, t)),
-                                    }
-                                ),
-                            )
-                            summary_text = (
-                                "Workflow complete (statistics classifier).\n"
-                                f"Selected {stats_res.selected_count} polygons via spectral rules.\n"
-                                f"Saved to:\n{stats_res.output_path}"
-                            )
-                            result_output_path = str(stats_res.output_path)
-                            page.pubsub.send_all({"kind": "result", "text": summary_text})
-                            try:
-                                preview_path = build_classification_map(
-                                    stats_res.output_path,
-                                    in_raster.value.strip(),
-                                    mode="stats",
-                                    aoi_path=aoi_final,
-                                    biomass_model=bio_model,
-                                    biomass_formula=bio_formula,
-                                    growth_rate_pct=growth_rate_val,
-                                    growth_rate_sd=growth_sd_val,
-                                )
-                            except Exception:
-                                preview_path = None
+                        except Exception:
+                            preview_path = None
                         if preview_path:
                             page.pubsub.send_all({"kind": "classification_preview", "path": str(preview_path)})
                         if result_output_path:
                             completed = datetime.now()
                             label = completed.strftime("%Y-%m-%d %H:%M:%S")
-                            metrics = {"aois": int(n_aoi), "segments": int(len(combined))}
+                            metrics = {"aois": int(n_aoi)}
                             try:
                                 safe_settings = json.loads(json.dumps(settings_snapshot))
                             except Exception:
                                 safe_settings = settings_snapshot
                             record = {
                                 "id": run_ts,
-                                "label": f"{label} ({(mode_local or '').upper()})",
-                                "mode": mode_local,
+                                "label": f"{label} (RF)",
+                                "mode": "rf",
                                 "completed_at": completed.isoformat(),
                                 "summary": summary_text,
                                 "result_path": result_output_path,
@@ -1322,7 +1213,6 @@ def run_flet_app() -> None:
             "Project Paths",
             labeled_row("Input raster", ft.Row([in_raster, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: fp_raster.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.IMAGE_OUTLINED, tip="Path to input imagery (GeoTIFF)."),
             labeled_row("Output directory", ft.Row([output_dir, ft.OutlinedButton("Browse", icon=ft.icons.FOLDER_OPEN, on_click=lambda _: dp_output.get_directory_path())], expand=True), icon=ft.icons.FOLDER, tip="Folder where results will be written."),
-            labeled_row("OTB path", ft.Row([otb_bin, ft.OutlinedButton("Browse", icon=ft.icons.BUILD_OUTLINED, on_click=lambda _: fp_otb.pick_files(allow_multiple=False))], expand=True), icon=ft.icons.BUILD_OUTLINED, tip="Path to OTB LargeScaleMeanShift executable."),
             labeled_row(
                 "Custom AOI (.shp)",
                 ft.Row(
@@ -1387,21 +1277,6 @@ def run_flet_app() -> None:
             subtitle="Tune AOI detection and run.",
             bgcolor="#EAF7F5",
         )
-        # Segmentation (blue)
-        tile_size = ft.TextField(value="40", width=120)
-        spatialr = ft.TextField(value="5", width=120)
-        minsize = ft.TextField(value="5", width=120)
-        seg = section(
-            "Segmentation",
-            ft.Row([
-                labeled_row("Tile size (m)", tile_size, icon=ft.icons.STRAIGHTEN, tip="Tile size for mean-shift segmentation."),
-                labeled_row("Spatialr", spatialr, icon=ft.icons.GRAIN, tip="Spatial radius parameter of mean-shift."),
-                labeled_row("Minsize", minsize, icon=ft.icons.DETAILS, tip="Minimum region size for merging."),
-            ], wrap=True),
-            subtitle="OTB LargeScaleMeanShift parameters.",
-            bgcolor="#ECF4FB",
-        )
-
         # Classification (amber)
         model_path = ft.Dropdown(
             options=[],
@@ -1774,7 +1649,7 @@ def run_flet_app() -> None:
 
         # Two-column responsive layout: each section ~half width
         left_col = ft.Column([left, pre], expand=1, spacing=12)
-        right_col = ft.Column([seg, clf, bio_section], expand=1, spacing=12)
+        right_col = ft.Column([clf, bio_section], expand=1, spacing=12)
 
         main_row = ft.Row(
             [left_col, right_col],
