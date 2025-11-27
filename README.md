@@ -1,69 +1,60 @@
 # Madakappy
 
-Seaweed mapping and biomass estimation suite with two UIs (modern Flet and fallback Tk). This guide covers installation options and what each major feature does.
+🌊 Seaweed mapping & biomass estimation with a modern Flet UI (and a Tk fallback). This guide covers installation and what each feature does.
 
-## Install / Launch
+## 🚀 Install / Launch
 
-### Option 1: Conda environment (all platforms)
-1. Create or update the env: `conda env update -f environment.yml`
-2. Activate: `conda activate Madakappy`
-3. Run:
-   - Modern Flet UI (recommended): `MADAKAPPY_UI=flet python -m app.main` (PowerShell: `$env:MADAKAPPY_UI="flet"; python -m app.main`)
-   - Tk UI fallback: `python -m app.main`
+Pick one:
 
-### Option 2: Packaged installer (Windows, via Inno)
-- Build the .exe with `flet pack` + your Inno setup script, then install.
-- After installation, launch the “Madakappy” shortcut; it ships the Conda-based runtime and opens the Flet UI.
+1) **Installer (Windows)**  
+   - Download and run: `XXX`  
+   - Launch the “Madakappy” shortcut; everything is bundled.
 
-### Option 3: Simple launchers (source checkout)
-- Windows: double-click `launch/run_madakappy.bat`
-- macOS: double-click `launch/run_madakappy.command` (make executable if needed)
-- Linux: `chmod +x launch/run_madakappy.sh` then run it
+2) **Manual (Conda, all platforms)**  
+   - Create/update env: `conda env update -f environment.yml`  
+   - Activate: `conda activate Madakappy`  
+   - Run Flet UI (recommended):  
+     - PowerShell: `$env:MADAKAPPY_UI="flet"; python -m app.main`  
+     - macOS/Linux: `MADAKAPPY_UI=flet python -m app.main`  
+   - Tk fallback: `python -m app.main`  
+   - Quick launchers (after env):  
+     - Windows: double-click `launch/run_madakappy.bat`  
+     - macOS: `chmod +x launch/run_madakappy.command` then double-click  
+     - Linux: `chmod +x launch/run_madakappy.sh` then run/double-click
 
-## Features and how to use them
+## 🧭 Key panels
 
-### Project Paths
-- **Input raster**: GeoTIFF to process (projected CRS required).
-- **Output directory**: Root where results, models, and history are written.
-- **Run name (optional)**: Custom label used in output folder/file names and history.
-- **Model directory (Flet UI)**: Folder containing `.joblib` RF models; refreshes the dropdown.
-- **Custom AOI (.shp)**: Skip preselection and use your own polygons; they open in the editor for review.
+- **Project Paths**: input raster (projected CRS), output directory, optional run name.  
+- **Model directory (Flet)**: folder with `.joblib` RF models; refresh to rescan.  
+- **Custom AOI (.shp)**: skip preselection and use your own polygons.
 
-### Preselection (AOI detection)
-- Detects cultivation plots from the raster using expected width/length ranges, small-plot buffering, and a blue-band quantile.
-- Produces AOI polygons you can review/confirm before classification; exports an AOI preview map.
+## 🔎 Preselection (AOI detection)
+- Uses expected width/length, small-plot buffer, and blue quantile to find plots.  
+- Outputs AOI polygons and an HTML preview; you confirm before classification.
 
-### Training (Random Forest)
-- Inputs: training raster, labeled polygons, class column, optional per-class pixel cap, optional model name.
-- Trains an RF, saves the model (`Model` directory or your chosen folder) and a confusion matrix image.
-- Model name is used for the `.joblib` filename; blank keeps timestamped naming.
+## 🧠 Training (Random Forest)
+- Inputs: training raster, labeled polygons, class column, optional per-class cap, optional model name.  
+- Saves the `.joblib` model (and confusion matrix) to your model directory; custom name if provided.
 
-### Classification (RF, pixel-wise vectorization)
-- Select a trained model and set pixels-per-polygon sampling limit.
-- Biomass options:
-  - **Preset models**: Madagascar linear/quadratic, Indonesia curve.
-  - **Custom equation**: Provide `biomass (g) = f(x)` using `x` = area in cm².
-  - **Computation mode**: Per-pixel sum (default) or polygon-area based.
-  - Growth rate and SD stored/applied for 7-day projections.
-- Outputs per-run shapefile in `Output/PixelRF/Run_<name or timestamp>`, plus an interactive HTML map preview.
-- Catalogue remembers runs; selecting one reopens its map (or rebuilds it if missing).
+## 🗺️ Classification (RF, pixel-wise)
+- Choose a model and pixels-per-polygon sampling cap.  
+- Biomass presets: Madagascar linear/quadratic, Indonesia, or custom formula (`x` = area in cm²).  
+- Biomass computation: per-pixel sum (default) or polygon-area based; growth rate & SD recorded.  
+- Outputs: `Output/PixelRF/Run_<name|timestamp>` shapefile + HTML map; Catalogue remembers runs.
 
-### Classification (Statistics / “dark rows”)
-- Lightweight rule-based classifier for dark linear features.
-- Respects the same biomass presets/custom equations and computation modes.
-- Outputs to `Output/2-Stats/Run_<name or timestamp>` with a preview map.
+## 🌑 Classification (Statistics / “dark rows”)
+- Lightweight rule-based detector for dark linear plots.  
+- Same biomass options/modes; outputs to `Output/2-Stats/Run_<name|timestamp>` with a preview map.
 
-### Biomass estimation
-- Driven by chosen model and computation mode:
-  - **Per-pixel**: compute biomass per pixel then sum per polygon.
-  - **Polygon area**: apply the biomass curve directly to polygon area (cm²).
-- Custom equations are validated for safety and use NumPy helpers (`np.log`, `np.sqrt`, etc.).
+## 🌱 Biomass estimation
+- Per-pixel: compute biomass per pixel, sum per polygon.  
+- Polygon-area: apply biomass curve to polygon area (cm²).  
+- Custom formulas validated (NumPy helpers like `np.log`, `np.sqrt` allowed).
 
-### History / Catalogue (Flet UI)
-- Shows past runs stored under the current Output directory.
-- Clicking a run opens its map (rebuilds if needed) and displays saved settings/metrics.
+## 📜 History / Catalogue (Flet)
+- Lists previous runs under the current Output directory; clicking opens/rebuilds the map and shows saved settings/metrics.
 
-## Notes / tips
-- Keep rasters in projected CRS (e.g., UTM) so pixel sizes are in meters.
-- The AOI editor opens after preselection; confirm before classification continues.
-- If Flet is unavailable, the app falls back to the Tk UI automatically.***
+## ✅ Tips
+- Use projected CRS (e.g., UTM) so pixel size is in meters.  
+- Confirm AOIs after preselection before running classification.  
+- If Flet isn’t available, the Tk UI launches automatically.
