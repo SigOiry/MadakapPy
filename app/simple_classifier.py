@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
+import re
 
 import geopandas as gpd
 import numpy as np
@@ -84,6 +85,8 @@ def classify_dark_linear_polygons(
     output_root: str | Path,
     biomass_model: str = "madagascar",
     biomass_formula: str | None = None,
+    biomass_calc_mode: str = "pixel",
+    run_name: str | None = None,
     growth_rate_pct: float = 5.8,
     growth_rate_sd: float = 0.7,
     progress: Optional[Progress] = None,
@@ -249,12 +252,22 @@ def classify_dark_linear_polygons(
 
     area_m2 = np.asarray(gdf.geometry.area, dtype=np.float64)
     area_m2 = np.maximum(area_m2, 0.0)
+    def _resolve_calc_mode(val: str | None) -> str:
+        key = (val or "pixel").strip().lower()
+        if key in {"area", "polygon", "poly", "plot"}:
+            return "area"
+        return "pixel"
+
+    bio_calc_mode = _resolve_calc_mode(biomass_calc_mode)
     biomass_per_pixel = float(np.asarray(biomass_from_area_cm2(pixel_area_cm2, biomass_model, biomass_formula)).item())
     pix_counts = np.where(pixel_area_m2 > 0, area_m2 / pixel_area_m2, 0.0)
     gdf["area_m2"] = area_m2
     gdf["area_cm2"] = area_m2 * 10000.0
     gdf["pix_count"] = pix_counts
-    gdf["biomass_g"] = pix_counts * biomass_per_pixel
+    if bio_calc_mode == "area":
+        gdf["biomass_g"] = biomass_from_area_cm2(gdf["area_cm2"], biomass_model, biomass_formula)
+    else:
+        gdf["biomass_g"] = pix_counts * biomass_per_pixel
     try:
         rate = float(growth_rate_pct) / 100.0
     except Exception:
@@ -268,10 +281,11 @@ def classify_dark_linear_polygons(
         gdf = gdf.to_crs(seg_crs)
 
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    run_slug = re.sub(r"[^0-9A-Za-z._-]+", "_", str(run_name)).strip("._-") if run_name else None
     out_base = base_out if base_out.name.lower() == "output" else base_out / "Output"
-    folder = out_base / "2-Stats" / f"Run_{ts}"
+    folder = out_base / "2-Stats" / f"Run_{run_slug or ts}"
     folder.mkdir(parents=True, exist_ok=True)
-    out_path = folder / f"Stats_{ts}.shp"
+    out_path = folder / f"Stats_{run_slug or ts}.shp"
     gdf.to_file(out_path)
 
     dur = time.time() - start

@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from collections import Counter, defaultdict
 
@@ -80,6 +81,12 @@ def _model_dir(base_out: Path) -> Path:
     if base_out.name.lower() == "output":
         return base_out.parent / "Model"
     return base_out / "Model"
+
+
+def _slugify_name(name: str, fallback: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z._-]+", "_", name).strip("._-")
+    return slug or fallback
+
 
 def _merge_segments_by_majority(gdf: gpd.GeoDataFrame, cls_to_field: dict[str, str]) -> gpd.GeoDataFrame:
     if "majority" not in gdf.columns:
@@ -254,6 +261,7 @@ def train_model_from_training_polys(
     progress: Optional[Progress] = None,
     max_pixels_per_class: Optional[int] = None,
     random_state: int = 42,
+    model_name: str | None = None,
 ) -> TrainResult:
     gdf = gpd.read_file(training_polys_path)
     if class_column not in gdf.columns:
@@ -380,7 +388,13 @@ def train_model_from_training_polys(
     mdir = _model_dir(base_out)
     mdir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    mpath = mdir / f"RF_{ts}.joblib"
+    base_name = f"RF_{ts}"
+    if model_name:
+        custom = _slugify_name(str(model_name), "model")
+        base_name = custom
+    mpath = mdir / f"{base_name}.joblib"
+    if mpath.exists():
+        mpath = mdir / f"{base_name}_{ts}.joblib"
 
     payload = {
         "model": best_rf,
@@ -391,7 +405,7 @@ def train_model_from_training_polys(
     joblib.dump(payload, mpath)
 
     # Save confusion matrix plot
-    cm_path = mdir / f"RF_{ts}_cm.png"
+    cm_path = mdir / f"{base_name}_cm.png"
     fig, ax = plt.subplots(figsize=(6, 5), dpi=120)
     im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
     ax.figure.colorbar(im, ax=ax)
@@ -482,6 +496,8 @@ def apply_model_pixelwise(
     aoi_id: int | None = None,
     biomass_model: str = "madagascar",
     biomass_formula: str | None = None,
+    biomass_calc_mode: str = "pixel",
+    run_name: str | None = None,
     growth_rate_pct: float = 5.8,
     growth_rate_sd: float = 0.7,
     progress: Optional[Progress] = None,
@@ -493,6 +509,13 @@ def apply_model_pixelwise(
     - Vectorizes connected components of the predicted class map.
     - Aggregates mean class probabilities per polygon and computes biomass projections.
     """
+    def _resolve_calc_mode(val: str | None) -> str:
+        key = (val or "pixel").strip().lower()
+        if key in {"area", "polygon", "poly", "plot"}:
+            return "area"
+        return "pixel"
+
+    bio_calc_mode = _resolve_calc_mode(biomass_calc_mode)
     payload = joblib.load(model_path)
     rf: RandomForestClassifier = payload["model"]
     le: LabelEncoder = payload["label_encoder"]
@@ -502,7 +525,11 @@ def apply_model_pixelwise(
     raster_path = str(raster_path)
     base_out = Path(output_root)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    folder = base_out / "Output" / f"PixelRF/Run_{ts}" if base_out.name.lower() != "output" else base_out / f"PixelRF/Run_{ts}"
+    run_slug = None
+    if run_name:
+        run_slug = _slugify_name(str(run_name), "run")
+    folder_name = f"Run_{run_slug or ts}"
+    folder = base_out / "Output" / f"PixelRF/{folder_name}" if base_out.name.lower() != "output" else base_out / f"PixelRF/{folder_name}"
     folder.mkdir(parents=True, exist_ok=True)
 
     with rasterio.open(raster_path) as src:
@@ -639,7 +666,15 @@ def apply_model_pixelwise(
             means_for_lbl = prob_means.get(lbl_id, {})
             for cls_k, fld_name in class_field_map.items():
                 rec[fld_name] = float(means_for_lbl.get(cls_k, 0.0))
-            rec["biomass_g"] = float(pix_count * biomass_per_pixel)
+            if bio_calc_mode == "area":
+                try:
+                    rec["biomass_g"] = float(
+                        np.asarray(biomass_from_area_cm2(rec["area_cm2"], biomass_model, biomass_formula)).item()
+                    )
+                except Exception:
+                    rec["biomass_g"] = float(pix_count * biomass_per_pixel)
+            else:
+                rec["biomass_g"] = float(pix_count * biomass_per_pixel)
             rec["biomass_t"] = rec["biomass_g"] / 1_000_000.0
             rec["biomass_sd"] = rec["biomass_g"] * sd_rate
             for day in range(1, 8):
@@ -665,7 +700,8 @@ def apply_model_pixelwise(
         }
         gdf = gdf.rename(columns={k: v for k, v in rename_map.items() if k in gdf.columns})
 
-        out_path = folder / f"Pixel_RF_{ts}.shp"
+        stem = f"Pixel_RF_{run_slug}" if run_slug else f"Pixel_RF_{ts}"
+        out_path = folder / f"{stem}.shp"
         out_path = _safe_write_gdf(gdf, out_path)
 
         preview_path: Optional[Path] = None
@@ -678,6 +714,7 @@ def apply_model_pixelwise(
                     aoi_path=aoi_path,
                     biomass_model=biomass_model,
                     biomass_formula=biomass_formula,
+                    biomass_calc_mode=bio_calc_mode,
                     growth_rate_pct=growth_rate_pct,
                     growth_rate_sd=growth_rate_sd,
                 )
@@ -704,6 +741,8 @@ def apply_model_with_pixel_sampling(
     biomass_formula: str | None = None,
     growth_rate_pct: float = 5.8,
     growth_rate_sd: float = 0.7,
+    biomass_calc_mode: str = "pixel",
+    run_name: str | None = None,
 ) -> ApplyResult:
     payload = joblib.load(model_path)
     rf: RandomForestClassifier = payload["model"]
@@ -734,6 +773,14 @@ def apply_model_with_pixel_sampling(
         cap = 1
 
     start = time.time()
+    def _resolve_calc_mode(val: str | None) -> str:
+        key = (val or "pixel").strip().lower()
+        if key in {"area", "polygon", "poly", "plot"}:
+            return "area"
+        return "pixel"
+
+    bio_calc_mode = _resolve_calc_mode(biomass_calc_mode)
+    run_slug = _slugify_name(str(run_name), "run") if run_name else None
     pixel_area_m2 = 1.0
     with rasterio.open(raster_path) as src:
         if getattr(getattr(src, "crs", None), "is_projected", False) is False:
@@ -879,10 +926,17 @@ def apply_model_with_pixel_sampling(
     gdf["plot_area_m2"] = counts * pixel_area_scale
     pixel_area_cm2 = pixel_area_scale * 10000.0
     gdf["plot_area_cm2"] = counts * pixel_area_cm2
-    try:
-        gdf["biomass_g"] = biomass_from_area_cm2(gdf["plot_area_cm2"].to_numpy(), bio_key, biomass_formula)
-    except Exception:
-        gdf["biomass_g"] = biomass_from_area_cm2(gdf["plot_area_cm2"], bio_key, biomass_formula)
+    if bio_calc_mode == "area":
+        try:
+            gdf["biomass_g"] = biomass_from_area_cm2(gdf["plot_area_cm2"].to_numpy(), bio_key, biomass_formula)
+        except Exception:
+            gdf["biomass_g"] = biomass_from_area_cm2(gdf["plot_area_cm2"], bio_key, biomass_formula)
+    else:
+        try:
+            biomass_per_pixel = float(np.asarray(biomass_from_area_cm2(pixel_area_cm2, bio_key, biomass_formula)).item())
+        except Exception:
+            biomass_per_pixel = 0.0
+        gdf["biomass_g"] = counts * biomass_per_pixel
     gdf["biomass_t"] = gdf["biomass_g"] / 1_000_000.0
     try:
         rate = float(growth_rate_pct) / 100.0
@@ -895,7 +949,8 @@ def apply_model_with_pixel_sampling(
 
     base_out = Path(output_root)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    folder = base_out / "Output" / f"2-RF/Run_{ts}" if base_out.name.lower() != "output" else base_out / f"2-RF/Run_{ts}"
+    folder_name = f"Run_{run_slug}" if run_slug else f"Run_{ts}"
+    folder = base_out / "Output" / f"2-RF/{folder_name}" if base_out.name.lower() != "output" else base_out / f"2-RF/{folder_name}"
     folder.mkdir(parents=True, exist_ok=True)
     keep_cols = []
     if "seg_id" in gdf.columns:
@@ -926,7 +981,8 @@ def apply_model_with_pixel_sampling(
     keep_cols = [c for c in keep_cols if c in gdf.columns]
     keep_cols.append("geometry")
     gdf = gdf[keep_cols]
-    out_path = folder / f"Classification_{ts}.shp"
+    stem = f"Classification_{run_slug}" if run_slug else f"Classification_{ts}"
+    out_path = folder / f"{stem}.shp"
     out_path = _safe_write_gdf(gdf, out_path)
     preview_path: Optional[Path] = None
     if generate_preview and _build_classification_map is not None:
@@ -938,6 +994,7 @@ def apply_model_with_pixel_sampling(
                 aoi_path=aoi_path,
                 biomass_model=bio_key,
                 biomass_formula=biomass_formula,
+                biomass_calc_mode=bio_calc_mode,
                 growth_rate_pct=growth_rate_pct,
                 growth_rate_sd=growth_rate_sd,
             )

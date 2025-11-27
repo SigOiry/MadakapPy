@@ -255,6 +255,7 @@ def build_classification_map(
     aoi_path: str | Path | None = None,
     biomass_model: str = "madagascar",
     biomass_formula: str | None = None,
+    biomass_calc_mode: str = "pixel",
     growth_rate_pct: float = 5.8,
     growth_rate_sd: float = 0.7,
 ) -> Path:

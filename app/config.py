@@ -21,6 +21,10 @@ class Session:
     seg_otb_bin: Optional[str] = None
     biomass_model: str = "madagascar"
     biomass_formula: Optional[str] = None
+    biomass_calc_mode: str = "pixel"
+    run_name: Optional[str] = None
+    model_name: Optional[str] = None
+    model_dir: Optional[str] = None
     growth_rate_pct: float = 5.8
     growth_rate_sd: float = 0.7
 
@@ -51,6 +55,10 @@ def load_session(location: Path | None = None) -> Optional[Session]:
         seg_otb_bin=data.get("seg_otb_bin"),
         biomass_model=(data.get("biomass_model") or "madagascar"),
         biomass_formula=data.get("biomass_formula"),
+        biomass_calc_mode=(data.get("biomass_calc_mode") or "pixel"),
+        run_name=data.get("run_name"),
+        model_name=data.get("model_name"),
+        model_dir=data.get("model_dir"),
         growth_rate_pct=float(data.get("growth_rate_pct", 5.8)),
         growth_rate_sd=float(data.get("growth_rate_sd", 0.7)),
     )

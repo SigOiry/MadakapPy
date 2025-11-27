@@ -1,1 +1,19 @@
-flet pack launch_flet.py --name Madakappy --icon app/assets/favicon.png  --hidden-import rasterio._base --hidden-import rasterio._io --hidden-import rasterio._env --hidden-import rasterio._err --hidden-import rasterio._features --hidden-import rasterio._warp --hidden-import rasterio._fill --hidden-import rasterio._features --hidden-import rasterio._path --hidden-import rasterio._sieve --hidden-import rasterio._rasterio --hidden-import rasterio._transform --hidden-import rasterio.sample --hidden-import rasterio.vrt
+.\.venv\Scripts\activate
+
+flet pack launch_flet.py `
+  --name "MadaKapPy" `
+  --icon "app\assets\favicon.ico" `
+  --debug-console all `
+  --hidden-import rasterio.sample `
+  --hidden-import rasterio._io `
+  --hidden-import rasterio._base `
+  --hidden-import rasterio._shim `
+  --hidden-import rasterio.crs `
+  --hidden-import rasterio.vrt `
+  --hidden-import pyogrio `
+  --hidden-import fiona `
+  --hidden-import pandas._libs.window.aggregations `
+  --hidden-import pandas._libs.groupby `
+  --add-data="Model;Model" `
+  --add-data="C:\Users\Simon\Documents\GiHub\Madakappy\.venv\Lib\site-packages\rasterio\gdal_data;gdal_data" `
+  --add-data="C:\Users\Simon\Documents\GiHub\Madakappy\.venv\Lib\site-packages\pyproj\proj_dir\share\proj;proj_data"

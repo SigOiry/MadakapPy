@@ -267,6 +267,66 @@ def detect_cultivation_plots(
         if min_area_m > 0:
             final_polys = [poly for poly in final_polys if poly.area >= min_area_m]
 
+        # Snap non-rectangular polygons to rectangles without changing overall extent
+        def _is_rectangle(poly: Polygon, tol: float = 1e-6) -> bool:
+            ring = list(poly.exterior.coords)
+            if len(ring) != 5:
+                return False
+            for i in range(4):
+                p0 = np.array(ring[i])
+                p1 = np.array(ring[i + 1])
+                p2 = np.array(ring[(i + 2) % 5])
+                v1 = p1 - p0
+                v2 = p2 - p1
+                if np.linalg.norm(v1) <= tol or np.linalg.norm(v2) <= tol:
+                    return False
+                dot = abs(np.dot(v1, v2))
+                if dot > tol * (np.linalg.norm(v1) * np.linalg.norm(v2) + tol):
+                    return False
+            return True
+
+        rectified: list[Polygon] = []
+        for poly in final_polys:
+            if poly.is_empty:
+                continue
+            if _is_rectangle(poly):
+                rectified.append(poly)
+            else:
+                rectified.append(poly.minimum_rotated_rectangle)
+
+        final_polys = rectified
+        if min_area_m > 0:
+            final_polys = [poly for poly in final_polys if poly.area >= min_area_m]
+
+        # Remove overlaps: larger polygons keep area, overlaps cut from smaller ones
+        def _remove_overlaps(polys: list[Polygon]) -> list[Polygon]:
+            ordered = sorted(polys, key=lambda p: p.area, reverse=True)
+            kept: list[Polygon] = []
+            for poly in ordered:
+                if poly.is_empty:
+                    continue
+                remainder = poly
+                for bigger in kept:
+                    try:
+                        if not remainder.intersects(bigger):
+                            continue
+                        remainder = remainder.difference(bigger)
+                    except Exception:
+                        pass
+                    if remainder.is_empty:
+                        break
+                if remainder.is_empty:
+                    continue
+                if isinstance(remainder, MultiPolygon):
+                    kept.extend([g for g in remainder.geoms if g.area > 0])
+                elif remainder.area > 0:
+                    kept.append(remainder)
+            return kept
+
+        final_polys = _remove_overlaps(final_polys)
+        if min_area_m > 0:
+            final_polys = [poly for poly in final_polys if poly.area >= min_area_m]
+
         try:
             gpd.GeoDataFrame(geometry=final_polys, crs=src.crs).to_file(temp_dir / "plots_filtered.shp")
         except Exception:

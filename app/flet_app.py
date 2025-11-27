@@ -581,6 +581,52 @@ def run_flet_app() -> None:
         page.window_maximized = True
         page.padding = 16
         page.bgcolor = pal["surface"]
+        splash = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Image(
+                        src="icons/loading-animation.png",
+                        width=220,
+                        height=220,
+                        fit=ft.ImageFit.CONTAIN,
+                    ),
+                    ft.Text(
+                        "Loading Madakappy...",
+                        size=14,
+                        color=pal["muted"],
+                        weight=ft.FontWeight.W_600,
+                    ),
+                ],
+                spacing=12,
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            alignment=ft.alignment.center,
+            expand=True,
+            padding=30,
+            bgcolor=pal["surface"],
+            opacity=0.9,
+        )
+        # Mirror the web loader for native/packed builds.
+        page.splash = splash
+        try:
+            page.update()
+        except Exception:
+            pass
+
+        def _hide_splash() -> None:
+            def _clear() -> None:
+                page.splash = None
+                try:
+                    page.update()
+                except Exception:
+                    pass
+            try:
+                page.call_from_thread(_clear)
+            except Exception:
+                _clear()
+
+        threading.Timer(1.2, _hide_splash).start()
 
         # Inputs
         default_in = str((Path("Data") / "All_cropped.tif").resolve())

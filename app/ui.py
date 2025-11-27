@@ -63,7 +63,11 @@ class ImageSelectorApp(ttk.Frame):
         self.var_classifier_mode = tk.StringVar(value="rf")
         self.var_biomass_model = tk.StringVar(value="madagascar")
         self.var_biomass_mode = tk.StringVar(value="preset")
+        self.var_biomass_calc_mode = tk.StringVar(value="pixel")
         self.var_biomass_formula = tk.StringVar()
+        self.var_run_name = tk.StringVar()
+        self.var_model_name = tk.StringVar()
+        self.var_model_dir = tk.StringVar(value=str((Path.cwd() / "Model").resolve()))
         self.var_growth_rate = tk.DoubleVar(value=5.8)
         self.var_growth_sd = tk.DoubleVar(value=0.7)
         self.var_train_raster = tk.StringVar(value=self.var_in_raster.get())
@@ -159,9 +163,14 @@ class ImageSelectorApp(ttk.Frame):
         self.out_entry = ttk.Entry(io)
         self.out_entry.grid(row=1, column=1, sticky="we", padx=6, pady=6)
         ttk.Button(io, text="📂 Select", command=self._on_pick_output).grid(row=1, column=2, padx=6, pady=6)
-        ttk.Label(io, text="Custom AOI (.shp, optional)").grid(row=2, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(io, textvariable=self.var_custom_aoi, width=56).grid(row=2, column=1, sticky="we", padx=6, pady=6)
-        ttk.Button(io, text="Browse", command=self._on_pick_custom_aoi).grid(row=2, column=2, padx=6, pady=6)
+        ttk.Label(io, text="Run name (optional)").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(io, textvariable=self.var_run_name, width=56).grid(row=2, column=1, sticky="we", padx=6, pady=6)
+        ttk.Label(io, text="Model directory").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(io, textvariable=self.var_model_dir, width=56).grid(row=3, column=1, sticky="we", padx=6, pady=6)
+        ttk.Button(io, text="Browse", command=self._on_pick_model_dir).grid(row=3, column=2, padx=6, pady=6)
+        ttk.Label(io, text="Custom AOI (.shp, optional)").grid(row=4, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(io, textvariable=self.var_custom_aoi, width=56).grid(row=4, column=1, sticky="we", padx=6, pady=6)
+        ttk.Button(io, text="Browse", command=self._on_pick_custom_aoi).grid(row=4, column=2, padx=6, pady=6)
         self.var_custom_aoi.trace_add("write", lambda *_: self._update_custom_aoi_state())
 
         try:
@@ -317,7 +326,7 @@ class ImageSelectorApp(ttk.Frame):
         ttk.Label(biof, text="Preset model").grid(row=1, column=0, sticky="w", padx=6, pady=4)
         self.cmb_biomass_model = ttk.Combobox(
             biof,
-            values=("madagascar", "indonesia"),
+            values=("madagascar", "madagascar_quadratic", "indonesia"),
             textvariable=self.var_biomass_model,
             state="readonly",
             width=18,
@@ -328,13 +337,28 @@ class ImageSelectorApp(ttk.Frame):
         ttk.Label(biof, text="biomass (g) =").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         self.txt_biomass_formula = ttk.Entry(biof, textvariable=self.var_biomass_formula)
         self.txt_biomass_formula.grid(row=2, column=1, sticky="we", padx=6, pady=4)
+        ttk.Label(biof, text="Computation").grid(row=3, column=0, sticky="w", padx=6, pady=4)
+        comp_frame = ttk.Frame(biof)
+        comp_frame.grid(row=3, column=1, sticky="w", padx=6, pady=4)
+        ttk.Radiobutton(
+            comp_frame,
+            text="Per-pixel (sum pixel biomass)",
+            value="pixel",
+            variable=self.var_biomass_calc_mode,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Radiobutton(
+            comp_frame,
+            text="Polygon area (one formula per plot)",
+            value="area",
+            variable=self.var_biomass_calc_mode,
+        ).grid(row=0, column=1, sticky="w")
         ttk.Label(biof, text="Use x for the plot area in cm^2", foreground="#666").grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6)
+            row=4, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6)
         )
-        ttk.Label(biof, text="Growth rate (%/day)").grid(row=4, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(biof, textvariable=self.var_growth_rate, width=12).grid(row=4, column=1, sticky="w", padx=6, pady=4)
-        ttk.Label(biof, text="Std. dev. (%/day)").grid(row=5, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(biof, textvariable=self.var_growth_sd, width=12).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(biof, text="Growth rate (%/day)").grid(row=5, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(biof, textvariable=self.var_growth_rate, width=12).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(biof, text="Std. dev. (%/day)").grid(row=6, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(biof, textvariable=self.var_growth_sd, width=12).grid(row=6, column=1, sticky="w", padx=6, pady=4)
 
         # Footer / status
         footer = ttk.Frame(workflow_tab, padding=(0, 8, 0, 0), style="Footer.TFrame")
@@ -376,17 +400,20 @@ class ImageSelectorApp(ttk.Frame):
         self.cmb_class_col.grid(row=2, column=1, sticky="we", padx=6, pady=6)
         ttk.Button(train_form, text="Load Fields", command=self._load_training_columns).grid(row=2, column=2, padx=6, pady=6)
 
-        ttk.Label(train_form, text="Max pixels per class").grid(row=3, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(train_form, textvariable=self.var_max_pixels_per_class, width=12).grid(row=3, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(train_form, text="Model name (optional)").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(train_form, textvariable=self.var_model_name, width=24).grid(row=3, column=1, sticky="w", padx=6, pady=6)
+
+        ttk.Label(train_form, text="Max pixels per class").grid(row=4, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(train_form, textvariable=self.var_max_pixels_per_class, width=12).grid(row=4, column=1, sticky="w", padx=6, pady=6)
         ttk.Label(
             train_form,
             text="If a class exceeds this limit, pixels are randomly sampled to match the count.",
             foreground="#666",
             wraplength=420,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
 
         self.lbl_training_info = ttk.Label(train_form, text="", foreground="#666")
-        self.lbl_training_info.grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        self.lbl_training_info.grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
 
         ttk.Button(self.train_tab, text="Train Model", command=self._on_train_model, style="Primary.TButton").grid(
             row=2, column=0, sticky="w", pady=(12, 0)
@@ -527,6 +554,12 @@ class ImageSelectorApp(ttk.Frame):
             self.var_custom_aoi.set(path)
             self._set_status("Custom AOI shapefile set")
 
+    def _on_pick_model_dir(self) -> None:
+        path = filedialog.askdirectory(title="Select model directory")
+        if path:
+            self.var_model_dir.set(path)
+            self._set_status("Model directory set")
+
     def _on_pick_otb(self) -> None:
         path = filedialog.askopenfilename(title="Select OTB LargeScaleMeanShift", filetypes=[
             ("Batch/Executable", "*.bat *.exe"),
@@ -577,6 +610,8 @@ class ImageSelectorApp(ttk.Frame):
         if bio_mode == "custom" and not bio_formula:
             self._toast("Enter biomass (g) = f(x) using x for the plot area (cm^2)", kind="error")
             return
+        bio_calc_mode = (self.var_biomass_calc_mode.get() or "pixel").strip().lower()
+        run_name = (self.var_run_name.get() or "").strip()
         growth_rate = float(self.var_growth_rate.get() or 5.8)
         growth_sd = float(self.var_growth_sd.get() or 0.7)
 
@@ -590,6 +625,9 @@ class ImageSelectorApp(ttk.Frame):
             seg_otb_bin=self.var_otb_bin.get() or None,
             biomass_model=("custom" if bio_mode == "custom" else bio_model),
             biomass_formula=(bio_formula if bio_mode == "custom" else None),
+            biomass_calc_mode=bio_calc_mode,
+            run_name=(run_name or None),
+            model_dir=(self.var_model_dir.get() or None),
             growth_rate_pct=growth_rate,
             growth_rate_sd=growth_sd,
         )
@@ -716,6 +754,7 @@ class ImageSelectorApp(ttk.Frame):
                     def pick_model():
                         return filedialog.askopenfilename(
                             title="Select model file",
+                            initialdir=(self.var_model_dir.get() or None),
                             filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")],
                         )
 
@@ -749,6 +788,8 @@ class ImageSelectorApp(ttk.Frame):
                         aoi_path=self._last_aoi_path,
                         biomass_model=session.biomass_model,
                         biomass_formula=session.biomass_formula,
+                        biomass_calc_mode=session.biomass_calc_mode,
+                        run_name=session.run_name,
                         growth_rate_pct=session.growth_rate_pct,
                         growth_rate_sd=session.growth_rate_sd,
                     )
@@ -764,6 +805,8 @@ class ImageSelectorApp(ttk.Frame):
                         session.output_dir,
                         biomass_model=session.biomass_model,
                         biomass_formula=session.biomass_formula,
+                        run_name=session.run_name,
+                        biomass_calc_mode=session.biomass_calc_mode,
                         growth_rate_pct=session.growth_rate_pct,
                         growth_rate_sd=session.growth_rate_sd,
                         progress=make_cb("Statistics"),
@@ -778,6 +821,7 @@ class ImageSelectorApp(ttk.Frame):
                         aoi_path=self._last_aoi_path,
                         biomass_model=session.biomass_model,
                         biomass_formula=session.biomass_formula,
+                        biomass_calc_mode=session.biomass_calc_mode,
                         growth_rate_pct=session.growth_rate_pct,
                         growth_rate_sd=session.growth_rate_sd,
                     )
@@ -1063,6 +1107,7 @@ class ImageSelectorApp(ttk.Frame):
         train_raster = (self.var_train_raster.get() or "").strip() or (self.var_in_raster.get() or "").strip()
         train_path = (self.var_train_path.get() or "").strip()
         class_col = (self.var_class_col.get() or "").strip()
+        model_name = (self.var_model_name.get() or "").strip()
         if not train_raster:
             messagebox.showwarning("Missing image", "Select a training image before launching training.")
             return
@@ -1099,6 +1144,7 @@ class ImageSelectorApp(ttk.Frame):
                     out_root,
                     progress=cb,
                     max_pixels_per_class=(cap if cap > 0 else None),
+                    model_name=(model_name or None),
                 )
                 self._model_path = str(res.model_path)
                 def ok():
@@ -1117,7 +1163,7 @@ class ImageSelectorApp(ttk.Frame):
         path = filedialog.askopenfilename(title="Select model file", filetypes=[
             ("Joblib model", "*.joblib"),
             ("All files", "*.*"),
-        ])
+        ], initialdir=(self.var_model_dir.get() or None))
         if path:
             self.var_model_path.set(path)
             self._model_path = path
@@ -1152,9 +1198,13 @@ class ImageSelectorApp(ttk.Frame):
         bio_mode = (self.var_biomass_mode.get() or "preset").lower()
         bio_model = (self.var_biomass_model.get() or "madagascar").strip().lower()
         bio_formula = (self.var_biomass_formula.get() or "").strip()
+        bio_calc_mode = (self.var_biomass_calc_mode.get() or "pixel").strip().lower()
+        run_name = (self.var_run_name.get() or "").strip()
         if bio_mode == "custom" and not bio_formula:
             messagebox.showwarning("Missing biomass equation", "Enter biomass (g) = f(x) using x as plot area (cm^2).")
             return
+        growth_rate = float(self.var_growth_rate.get() or 5.8)
+        growth_sd = float(self.var_growth_sd.get() or 0.7)
         self._set_status("Classifying segments.")
 
         def cb(done: int, total: int, note: str = ""):
@@ -1182,6 +1232,8 @@ class ImageSelectorApp(ttk.Frame):
                     aoi_path=self._last_aoi_path,
                     biomass_model=("custom" if bio_mode == "custom" else bio_model),
                     biomass_formula=(bio_formula if bio_mode == "custom" else None),
+                    biomass_calc_mode=bio_calc_mode,
+                    run_name=(run_name or None),
                     growth_rate_pct=growth_rate,
                     growth_rate_sd=growth_sd,
                 )

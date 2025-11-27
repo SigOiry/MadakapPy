@@ -52,6 +52,23 @@ def _validate_formula(expr: str) -> ast.Expression:
                 raise ValueError("Unsupported function call in biomass equation.")
     return tree
 
+def fw_biocapped(arr_cm2):
+    A_cal_max = 500  # cm² (max area used in calibration)
+
+    # Original model
+    fw_pred = 0.014 * np.power(arr_cm2, 1.65)
+
+    # Biological density cap from calibration limit
+    fw_cal_max = 0.014 * (A_cal_max ** 1.65)
+    rho_max = fw_cal_max / A_cal_max  # g/cm²
+
+    # Maximum allowed FW based on capped density
+    fw_cap = rho_max * arr_cm2
+
+    # Apply cap
+    fw_corrected = np.minimum(fw_pred, fw_cap)
+
+    return fw_corrected
 
 def _eval_custom_formula(expr: str, area_cm2: np.ndarray) -> np.ndarray:
     x = np.asarray(area_cm2, dtype=np.float64)
@@ -97,10 +114,11 @@ def biomass_from_area_cm2(
     if key == "indonesia":
         # Nurdin et al. 2023: biomass(g) = 0.014 * area(cm^2) ^ 1.65
         with np.errstate(invalid="ignore"):
-            return 0.014 * np.power(arr, 1.65)
+            return fw_biocapped(arr)
+            # return 0.014 * 1.65 * np.power(arr, 0.65)
     if key in {"madagascar_poly", "madagascar_quadratic"}:
-        return (-0.0022 * arr * arr) + (2.3389 * arr) + 29.771
-    # Default: Madagascar linear relationship
+        # return (-0.00057 * arr * arr) + (0.23244 * arr) + 13.2624
+        return 0.19982 * arr ** 1.15378   # Default: Madagascar linear relationship
     return 0.5621 * arr
 
 

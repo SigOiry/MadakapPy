@@ -1,3 +1,6 @@
 Data/Ortho_Multi_Overall.tif
 Output/*
 Temp/*
+build/*
+dist/*
+Compile/*
